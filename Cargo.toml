@@ -1,6 +1,6 @@
 [package]
 name = "noksiy"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["nesstyx", "Claude <noreply@anthropic.com>"]
 description = "Noksiy - The world's strongest AI-written chess engine in Rust"

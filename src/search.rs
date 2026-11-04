@@ -3,6 +3,7 @@ use crate::movegen::MoveGenerator;
 use crate::evaluation::Evaluator;
 use crate::zobrist::Zobrist;
 use crate::transposition::{TranspositionTable, NodeType};
+use crate::see::SEE;
 use std::time::{Duration, Instant};
 
 const MAX_DEPTH: u8 = 64;
@@ -17,6 +18,12 @@ const NULL_MOVE_MIN_DEPTH: u8 = 3;
 const LMR_MIN_DEPTH: u8 = 3;
 const LMR_FULL_DEPTH_MOVES: usize = 4;
 const LMR_REDUCTION_LIMIT: u8 = 3;
+
+// Futility Pruning margins
+const FUTILITY_MARGIN: [i32; 4] = [0, 200, 300, 500];
+
+// Razoring margins
+const RAZOR_MARGIN: [i32; 4] = [0, 300, 400, 600];
 
 pub struct SearchInfo {
     pub nodes: u64,
@@ -208,6 +215,23 @@ impl Search {
             }
         }
 
+        // Razoring - if eval is way below alpha, try qsearch
+        if !is_pv_node
+            && !in_check
+            && depth <= 3
+            && depth > 0
+        {
+            let static_eval = Evaluator::evaluate(board);
+            let razor_margin = RAZOR_MARGIN[depth as usize];
+
+            if static_eval + razor_margin < alpha {
+                let qscore = self.quiescence(board, alpha - razor_margin, alpha - razor_margin + 1, info);
+                if qscore + razor_margin <= alpha {
+                    return qscore;
+                }
+            }
+        }
+
         let moves = self.movegen.generate_moves(board);
 
         // Checkmate/stalemate detection
@@ -235,6 +259,47 @@ impl Search {
             let mut score;
             let gives_check = new_board.in_check();
 
+            // Check extension - extend search when giving check
+            let extension = if gives_check && depth < MAX_DEPTH - 1 {
+                1
+            } else {
+                0
+            };
+
+            // Futility Pruning - skip quiet moves that can't improve alpha
+            if !is_pv_node
+                && !in_check
+                && !gives_check
+                && depth <= 3
+                && depth > 0
+                && mv.captured.is_none()
+                && mv.promotion.is_none()
+                && move_num >= LMR_FULL_DEPTH_MOVES
+            {
+                let static_eval = if move_num == 0 {
+                    Evaluator::evaluate(board)
+                } else {
+                    alpha
+                };
+
+                let futility_margin = FUTILITY_MARGIN[depth as usize];
+                if static_eval + futility_margin <= alpha {
+                    continue; // Skip this move
+                }
+            }
+
+            // SEE pruning for bad captures
+            if move_num > 0
+                && mv.captured.is_some()
+                && !gives_check
+                && !in_check
+            {
+                let see_value = SEE::evaluate(board, mv.from, mv.to, mv.piece);
+                if see_value < 0 {
+                    continue; // Skip losing capture
+                }
+            }
+
             // Late Move Reductions (LMR)
             if move_num >= LMR_FULL_DEPTH_MOVES
                 && depth >= LMR_MIN_DEPTH
@@ -249,7 +314,7 @@ impl Search {
                 // Search with reduced depth
                 score = -self.search(
                     &new_board,
-                    depth - 1 - reduction,
+                    depth - 1 - reduction + extension,
                     -alpha - 1,
                     -alpha,
                     ply + 1,
@@ -261,7 +326,7 @@ impl Search {
                 if score > alpha {
                     score = -self.search(
                         &new_board,
-                        depth - 1,
+                        depth - 1 + extension,
                         -beta,
                         -alpha,
                         ply + 1,
@@ -273,7 +338,7 @@ impl Search {
                 // Full depth search for important moves
                 score = -self.search(
                     &new_board,
-                    depth - 1,
+                    depth - 1 + extension,
                     -beta,
                     -alpha,
                     ply + 1,
