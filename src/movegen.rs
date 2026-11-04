@@ -1,4 +1,5 @@
 use crate::board::{Board, Bitboard, Piece, Color, Move};
+use crate::magic::MagicBitboards;
 
 // Precalculated attack tables for fast move generation
 pub struct MoveGenerator {
@@ -122,6 +123,7 @@ impl MoveGenerator {
         let mut moves = Vec::with_capacity(128);
         let color = board.side_to_move;
         let color_idx = color as usize;
+        let magic = MagicBitboards::get();
 
         // Generate pawn moves
         self.generate_pawn_moves(board, &mut moves);
@@ -136,47 +138,38 @@ impl MoveGenerator {
             self.add_moves_from_bitboard(from, attacks, Piece::Knight, board, &mut moves);
         }
 
-        // Generate bishop moves
+        // Generate bishop moves (using Magic Bitboards)
         let mut bishops = board.pieces[color_idx][Piece::Bishop as usize];
         while bishops != 0 {
             let from = bishops.trailing_zeros() as u8;
             bishops &= bishops - 1;
 
-            let attacks = Self::generate_sliding_attacks(
-                from as usize,
-                board.all_occupied,
-                &[(-1, -1), (-1, 1), (1, -1), (1, 1)],
-            ) & !board.occupied[color_idx];
+            let attacks = magic.get_bishop_attacks(from as usize, board.all_occupied)
+                & !board.occupied[color_idx];
 
             self.add_moves_from_bitboard(from, attacks, Piece::Bishop, board, &mut moves);
         }
 
-        // Generate rook moves
+        // Generate rook moves (using Magic Bitboards)
         let mut rooks = board.pieces[color_idx][Piece::Rook as usize];
         while rooks != 0 {
             let from = rooks.trailing_zeros() as u8;
             rooks &= rooks - 1;
 
-            let attacks = Self::generate_sliding_attacks(
-                from as usize,
-                board.all_occupied,
-                &[(-1, 0), (1, 0), (0, -1), (0, 1)],
-            ) & !board.occupied[color_idx];
+            let attacks = magic.get_rook_attacks(from as usize, board.all_occupied)
+                & !board.occupied[color_idx];
 
             self.add_moves_from_bitboard(from, attacks, Piece::Rook, board, &mut moves);
         }
 
-        // Generate queen moves
+        // Generate queen moves (using Magic Bitboards)
         let mut queens = board.pieces[color_idx][Piece::Queen as usize];
         while queens != 0 {
             let from = queens.trailing_zeros() as u8;
             queens &= queens - 1;
 
-            let attacks = Self::generate_sliding_attacks(
-                from as usize,
-                board.all_occupied,
-                &[(-1, -1), (-1, 1), (1, -1), (1, 1), (-1, 0), (1, 0), (0, -1), (0, 1)],
-            ) & !board.occupied[color_idx];
+            let attacks = magic.get_queen_attacks(from as usize, board.all_occupied)
+                & !board.occupied[color_idx];
 
             self.add_moves_from_bitboard(from, attacks, Piece::Queen, board, &mut moves);
         }

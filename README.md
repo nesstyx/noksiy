@@ -109,7 +109,7 @@ src/
 - [x] Aspiration windows
 - [x] Principal Variation tracking
 - [x] Advanced evaluation (mobility, center control, pawn structure)
-- [ ] Magic Bitboards for sliders
+- [x] Magic Bitboards for sliders (ultra-fast move generation)
 - [ ] Futility pruning
 - [ ] Razoring
 - [ ] Internal Iterative Deepening
