@@ -1,10 +1,13 @@
 [package]
 name = "noksiy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["nesstyx", "Claude <noreply@anthropic.com>"]
-description = "Noksiy - Самый сильный шахматный движок в мире, написанный на Rust"
+description = "Noksiy - The world's strongest AI-written chess engine in Rust"
 license = "MIT"
+repository = "https://github.com/nesstyx/noksiy"
+keywords = ["chess", "engine", "ai", "uci", "bitboard"]
+categories = ["games"]
 
 [dependencies]
 

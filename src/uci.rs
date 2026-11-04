@@ -39,19 +39,27 @@ impl UciEngine {
                 "go" => self.go(&parts[1..]),
                 "quit" => break,
                 "d" | "display" => self.display(),
+                "clear" => self.clear_tt(),
                 _ => {}
             }
         }
     }
 
     fn uci(&self) {
-        println!("id name Noksiy 0.1.0");
-        println!("id author nesstyx & Claude");
+        println!("id name Noksiy 0.2.0");
+        println!("id author nesstyx & Claude (AI-generated)");
+        println!("option name Hash type spin default 128 min 1 max 1024");
         println!("uciok");
     }
 
     fn new_game(&mut self) {
         self.board = Board::new();
+        self.search.clear_tt();
+    }
+
+    fn clear_tt(&mut self) {
+        self.search.clear_tt();
+        println!("info string Transposition table cleared");
     }
 
     fn position(&mut self, args: &[&str]) {
@@ -63,13 +71,13 @@ impl UciEngine {
             "startpos" => {
                 self.board = Board::new();
 
-                // Проверяем, есть ли ходы после startpos
+                // Check for moves after startpos
                 if args.len() > 1 && args[1] == "moves" {
                     self.apply_moves(&args[2..]);
                 }
             }
             "fen" => {
-                // Собираем FEN строку (она может содержать пробелы)
+                // Collect FEN string (may contain spaces)
                 let mut fen_parts = Vec::new();
                 let mut i = 1;
 
@@ -81,7 +89,7 @@ impl UciEngine {
                 let fen = fen_parts.join(" ");
                 self.board = Board::from_fen(&fen);
 
-                // Применяем ходы, если есть
+                // Apply moves if present
                 if i < args.len() && args[i] == "moves" {
                     self.apply_moves(&args[i + 1..]);
                 }
@@ -96,7 +104,7 @@ impl UciEngine {
         for move_str in move_strs {
             let legal_moves = movegen.generate_moves(&self.board);
 
-            // Парсим ход в формате UCI (e2e4, e7e8q и т.д.)
+            // Parse move in UCI format (e2e4, e7e8q, etc.)
             if let Some(mv) = self.parse_uci_move(move_str, &legal_moves) {
                 self.board.make_move(mv);
             }
@@ -111,10 +119,10 @@ impl UciEngine {
         let from = Self::algebraic_to_square(&move_str[0..2])?;
         let to = Self::algebraic_to_square(&move_str[2..4])?;
 
-        // Ищем соответствующий легальный ход
+        // Find corresponding legal move
         for &mv in legal_moves {
             if mv.from == from && mv.to == to {
-                // Проверяем промоушен, если указан
+                // Check promotion if specified
                 if move_str.len() > 4 {
                     let promo_char = move_str.chars().nth(4)?;
                     let expected_promo = match promo_char {
@@ -128,7 +136,7 @@ impl UciEngine {
                     if mv.promotion == Some(expected_promo) {
                         return Some(mv);
                     }
-                } else {
+                } else if mv.promotion.is_none() {
                     return Some(mv);
                 }
             }
@@ -154,7 +162,7 @@ impl UciEngine {
     }
 
     fn go(&mut self, args: &[&str]) {
-        let mut depth = 6; // По умолчанию глубина 6
+        let mut depth = 8; // Default depth 8
         let mut time_limit = None;
 
         let mut i = 0;
@@ -162,7 +170,7 @@ impl UciEngine {
             match args[i] {
                 "depth" => {
                     if i + 1 < args.len() {
-                        depth = args[i + 1].parse().unwrap_or(6);
+                        depth = args[i + 1].parse().unwrap_or(8);
                         i += 2;
                     } else {
                         i += 1;
@@ -193,7 +201,7 @@ impl UciEngine {
         if let Some(best_move) = self.search.find_best_move(&self.board, depth, time_limit) {
             println!("bestmove {}", self.format_move(&best_move));
         } else {
-            // Если нет легальных ходов, возвращаем нулевой ход
+            // No legal moves available, return null move
             println!("bestmove 0000");
         }
     }
@@ -235,6 +243,7 @@ impl UciEngine {
         }
         println!("    a   b   c   d   e   f   g   h\n");
         println!("Side to move: {:?}", self.board.side_to_move);
+        println!("FEN: {}", self.board_to_fen());
     }
 
     fn get_piece_at(&self, square: u8) -> char {
@@ -263,6 +272,61 @@ impl UciEngine {
         }
 
         ' '
+    }
+
+    fn board_to_fen(&self) -> String {
+        let mut fen = String::new();
+
+        // Board position
+        for rank in (0..8).rev() {
+            let mut empty = 0;
+            for file in 0..8 {
+                let square = rank * 8 + file;
+                let piece = self.get_piece_at(square);
+
+                if piece == ' ' {
+                    empty += 1;
+                } else {
+                    if empty > 0 {
+                        fen.push_str(&empty.to_string());
+                        empty = 0;
+                    }
+                    fen.push(piece);
+                }
+            }
+            if empty > 0 {
+                fen.push_str(&empty.to_string());
+            }
+            if rank > 0 {
+                fen.push('/');
+            }
+        }
+
+        // Side to move
+        fen.push(' ');
+        fen.push(if self.board.side_to_move == crate::board::Color::White { 'w' } else { 'b' });
+
+        // Castling rights
+        fen.push(' ');
+        let mut castling = String::new();
+        if self.board.castling_rights & 0b0001 != 0 { castling.push('K'); }
+        if self.board.castling_rights & 0b0010 != 0 { castling.push('Q'); }
+        if self.board.castling_rights & 0b0100 != 0 { castling.push('k'); }
+        if self.board.castling_rights & 0b1000 != 0 { castling.push('q'); }
+        fen.push_str(if castling.is_empty() { "-" } else { &castling });
+
+        // En passant
+        fen.push(' ');
+        if let Some(ep) = self.board.en_passant_square {
+            fen.push_str(&Self::square_to_algebraic(ep));
+        } else {
+            fen.push('-');
+        }
+
+        // Halfmove clock and fullmove number
+        fen.push_str(&format!(" {} {}", self.board.halfmove_clock, self.board.fullmove_number));
+
+        fen
     }
 }
 

@@ -1,6 +1,6 @@
 use crate::board::{Board, Bitboard, Piece, Color, Move};
 
-// Precalculated attack tables для быстрой генерации ходов
+// Precalculated attack tables for fast move generation
 pub struct MoveGenerator {
     knight_attacks: [Bitboard; 64],
     king_attacks: [Bitboard; 64],
@@ -198,6 +198,7 @@ impl MoveGenerator {
         let opp_color_idx = color.opposite() as usize;
         let direction = if color == Color::White { 8 } else { -8 };
         let start_rank = if color == Color::White { 1 } else { 6 };
+        let promotion_rank = if color == Color::White { 7 } else { 0 };
 
         let mut pawns = board.pieces[color_idx][Piece::Pawn as usize];
 
@@ -210,37 +211,99 @@ impl MoveGenerator {
             // Single push
             let to = (from as i8 + direction) as u8;
             if (board.all_occupied & (1u64 << to)) == 0 {
-                moves.push(Move {
-                    from,
-                    to,
-                    piece: Piece::Pawn,
-                    captured: None,
-                    promotion: None,
-                    is_castle: false,
-                    is_en_passant: false,
-                });
-
-                // Double push
-                if from_rank == start_rank {
-                    let to2 = (from as i8 + direction * 2) as u8;
-                    if (board.all_occupied & (1u64 << to2)) == 0 {
+                // Check for promotion
+                if to / 8 == promotion_rank {
+                    // Generate all promotion moves
+                    for promo_piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
                         moves.push(Move {
                             from,
-                            to: to2,
+                            to,
                             piece: Piece::Pawn,
                             captured: None,
-                            promotion: None,
+                            promotion: Some(promo_piece),
                             is_castle: false,
                             is_en_passant: false,
                         });
+                    }
+                } else {
+                    moves.push(Move {
+                        from,
+                        to,
+                        piece: Piece::Pawn,
+                        captured: None,
+                        promotion: None,
+                        is_castle: false,
+                        is_en_passant: false,
+                    });
+
+                    // Double push
+                    if from_rank == start_rank {
+                        let to2 = (from as i8 + direction * 2) as u8;
+                        if (board.all_occupied & (1u64 << to2)) == 0 {
+                            moves.push(Move {
+                                from,
+                                to: to2,
+                                piece: Piece::Pawn,
+                                captured: None,
+                                promotion: None,
+                                is_castle: false,
+                                is_en_passant: false,
+                            });
+                        }
                     }
                 }
             }
 
             // Captures
             let attacks = self.pawn_attacks[color_idx][from as usize];
-            let captures = attacks & board.occupied[opp_color_idx];
-            self.add_moves_from_bitboard(from, captures, Piece::Pawn, board, moves);
+            let mut captures = attacks & board.occupied[opp_color_idx];
+
+            while captures != 0 {
+                let to = captures.trailing_zeros() as u8;
+                captures &= captures - 1;
+
+                let captured = self.get_captured_piece(to, board, opp_color_idx);
+
+                // Check for promotion
+                if to / 8 == promotion_rank {
+                    for promo_piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
+                        moves.push(Move {
+                            from,
+                            to,
+                            piece: Piece::Pawn,
+                            captured,
+                            promotion: Some(promo_piece),
+                            is_castle: false,
+                            is_en_passant: false,
+                        });
+                    }
+                } else {
+                    moves.push(Move {
+                        from,
+                        to,
+                        piece: Piece::Pawn,
+                        captured,
+                        promotion: None,
+                        is_castle: false,
+                        is_en_passant: false,
+                    });
+                }
+            }
+
+            // En passant
+            if let Some(ep_square) = board.en_passant_square {
+                if (attacks & (1u64 << ep_square)) != 0 {
+                    moves.push(Move {
+                        from,
+                        to: ep_square,
+                        piece: Piece::Pawn,
+                        captured: Some(Piece::Pawn),
+                        promotion: None,
+                        is_castle: false,
+                        is_en_passant: true,
+                    });
+                }
+            }
         }
     }
 

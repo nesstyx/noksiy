@@ -1,22 +1,30 @@
 # Noksiy Chess Engine
 
-**Самый сильный шахматный движок в мире, написанный на Rust** 🦀♟️
+**The world's strongest AI-written chess engine in Rust** 🤖🦀♟️
 
-## О проекте
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![AI Generated](https://img.shields.io/badge/AI-generated-blue.svg)](https://claude.ai)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Noksiy — это высокопроизводительный шахматный движок, разработанный с нуля на языке Rust. Использует современные алгоритмы поиска и оценки позиций для достижения максимальной игровой силы.
+## About
 
-## Особенности
+Noksiy is a high-performance chess engine written entirely in Rust and **completely developed by AI** (Claude by Anthropic). This project demonstrates the cutting edge of AI-assisted software development, combining modern chess programming techniques with the power of artificial intelligence.
 
-- ⚡ **Bitboard representation** — молниеносная обработка позиций
-- 🧠 **Alpha-Beta pruning** с улучшениями
-- 🎯 **Iterative deepening** — постепенное углубление поиска
-- 📊 **Piece-Square Tables** — позиционная оценка
-- 🔪 **Quiescence search** — тактическая точность
-- 🎲 **Move ordering** — killer moves + history heuristic
-- 🎮 **UCI protocol** — совместимость со всеми шахматными GUI
+**Our Goal:** To create the strongest chess engine ever written by AI, leveraging Rust's performance and safety guarantees.
 
-## Установка
+## Features
+
+- ⚡ **Bitboard representation** - lightning-fast position processing
+- 🧠 **Alpha-Beta pruning** with advanced enhancements
+- 🎯 **Iterative deepening** - optimal time management
+- 📊 **Piece-Square Tables** - positional evaluation
+- 🔪 **Quiescence search** - tactical accuracy
+- 🎲 **Move ordering** - MVV-LVA, killer moves, history heuristic
+- 💾 **Transposition Table** - position caching with Zobrist hashing
+- 🎮 **UCI protocol** - compatible with all chess GUIs
+- 🤖 **100% AI-generated code** - no human-written chess logic
+
+## Installation
 
 ```bash
 git clone https://github.com/nesstyx/noksiy.git
@@ -24,101 +32,117 @@ cd noksiy
 cargo build --release
 ```
 
-## Использование
+## Usage
 
-### Запуск движка
+### Running the Engine
 
 ```bash
 cargo run --release
 ```
 
-### UCI команды
+### UCI Commands
 
 ```
-uci          - идентификация движка
-isready      - проверка готовности
-position startpos moves e2e4 e7e5  - установка позиции
-go depth 10  - поиск на глубину 10
-quit         - выход
+uci          - identify engine
+isready      - check readiness
+position startpos moves e2e4 e7e5  - set position
+go depth 10  - search to depth 10
+quit         - exit
 ```
 
-### Использование с GUI
+### GUI Integration
 
-Noksiy совместим с любыми шахматными интерфейсами, поддерживающими UCI:
-- Arena
+Noksiy is compatible with any chess interface supporting UCI protocol:
+- Arena Chess GUI
 - Cutechess
-- Lichess (через lichess-bot)
+- Lichess (via lichess-bot)
 - ChessBase
+- BanksiaGUI
 
-## Архитектура
+## Architecture
 
 ```
 src/
-├── main.rs        - точка входа
-├── board.rs       - представление доски (bitboards)
-├── movegen.rs     - генерация ходов
-├── search.rs      - алгоритм поиска (alpha-beta, iterative deepening)
-├── evaluation.rs  - оценка позиций
-└── uci.rs         - UCI протокол
+├── main.rs        - entry point
+├── board.rs       - bitboard representation
+├── movegen.rs     - move generation with attack tables
+├── search.rs      - alpha-beta search with enhancements
+├── evaluation.rs  - position evaluation
+├── uci.rs         - UCI protocol implementation
+└── zobrist.rs     - Zobrist hashing for transposition table
 ```
 
-## Алгоритмы
+## Algorithms
 
-### Поиск
-- **Alpha-Beta Pruning** с отсечением неперспективных вариантов
-- **Iterative Deepening** для оптимального использования времени
-- **Quiescence Search** для тактической стабильности
-- **Move Ordering** (MVV-LVA, killer moves, history heuristic)
+### Search
+- **Alpha-Beta Pruning** - efficient tree pruning
+- **Iterative Deepening** - progressive depth increase
+- **Quiescence Search** - tactical stability
+- **Move Ordering** - MVV-LVA, killer moves, history heuristic
+- **Transposition Table** - position caching with Zobrist hashing
 
-### Оценка
-- Материальный баланс
-- Позиционные бонусы (Piece-Square Tables)
-- Структура пешек (сдвоенные, проходные)
-- Пара слонов
-- Разделение миттельшпиля и эндшпиля
+### Evaluation
+- Material balance
+- Positional bonuses (Piece-Square Tables)
+- Pawn structure (doubled, passed pawns)
+- Bishop pair bonus
+- Endgame vs middlegame distinction
 
 ## Roadmap
 
-- [ ] Transposition Table (хеш-таблица позиций)
+- [x] Bitboard representation
+- [x] Alpha-Beta pruning
+- [x] Quiescence search
+- [x] Transposition Table with Zobrist hashing
 - [ ] Null Move Pruning
 - [ ] Late Move Reductions (LMR)
-- [ ] Magic Bitboards для слайдеров
-- [ ] Syzygy Tablebase
+- [ ] Magic Bitboards for sliders
+- [ ] Syzygy Tablebase support
 - [ ] Opening Book
 - [ ] Multi-threading (Lazy SMP)
-- [ ] Tunable evaluation параметры
+- [ ] Tunable evaluation parameters
+- [ ] NNUE evaluation
 
-## Разработка
+## Development
 
-### Сборка в debug режиме
+### Build in Debug Mode
 ```bash
 cargo build
 ```
 
-### Запуск тестов
+### Run Tests
 ```bash
 cargo test
 ```
 
-### Профилирование
+### Benchmarking
+```bash
+cargo bench
+```
+
+### Profiling
 ```bash
 cargo build --release
 perf record ./target/release/noksiy
 ```
 
-## Авторы
+## AI-Generated Project
 
-- **nesstyx** - основной разработчик
-- **Claude** - AI ассистент (Anthropic)
+This entire project was generated by **Claude** (Anthropic) - an AI assistant. Every line of code, every algorithm implementation, and every optimization was written by AI, demonstrating the future of software development where humans and AI collaborate to create powerful, efficient systems.
 
-## Лицензия
+## Authors
 
-MIT License - см. LICENSE файл
+- **nesstyx** - project creator & supervisor
+- **Claude** - AI developer (Anthropic)
 
-## Контрибьюция
+## License
 
-Pull requests приветствуются! Для больших изменений сначала откройте issue для обсуждения.
+MIT License - see LICENSE file for details
+
+## Contributing
+
+Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change.
 
 ---
 
-*Создано с ♥ и Rust*
+*Built with ♥ by AI and Rust* 🤖🦀

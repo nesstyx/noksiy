@@ -1,4 +1,4 @@
-// Bitboard representation для максимальной производительности
+// Bitboard representation for maximum performance
 pub type Bitboard = u64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,7 +39,7 @@ pub struct Move {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Board {
-    // Bitboards для каждой фигуры каждого цвета
+    // Bitboards for each piece of each color
     pub pieces: [[Bitboard; 6]; 2], // [color][piece_type]
     pub occupied: [Bitboard; 2],    // [color]
     pub all_occupied: Bitboard,
@@ -200,7 +200,7 @@ impl Board {
     }
 
     pub fn is_square_attacked(&self, _square: u8, by_color: Color) -> bool {
-        // Simplified attack detection (будет улучшено в movegen)
+        // Simplified attack detection (will be improved in movegen)
         let attackers = self.occupied[by_color as usize];
         attackers != 0
     }

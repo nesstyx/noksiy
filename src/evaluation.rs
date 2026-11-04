@@ -1,16 +1,16 @@
 use crate::board::{Board, Piece, Color};
 
-// Базовые ценности фигур в сантипешках
+// Base piece values in centipawns
 const PIECE_VALUES: [i32; 6] = [
-    100,  // Pawn
-    320,  // Knight
-    330,  // Bishop
-    500,  // Rook
-    900,  // Queen
+    100,   // Pawn
+    320,   // Knight
+    330,   // Bishop
+    500,   // Rook
+    900,   // Queen
     20000, // King
 ];
 
-// Piece-Square Tables для позиционной оценки
+// Piece-Square Tables for positional evaluation
 const PAWN_TABLE: [i32; 64] = [
     0,  0,  0,  0,  0,  0,  0,  0,
     50, 50, 50, 50, 50, 50, 50, 50,
@@ -94,7 +94,7 @@ impl Evaluator {
     pub fn evaluate(board: &Board) -> i32 {
         let mut score = 0;
 
-        // Подсчет материала и позиционной оценки
+        // Count material and positional evaluation
         for color in [Color::White, Color::Black] {
             let color_idx = color as usize;
             let sign = if color == Color::White { 1 } else { -1 };
@@ -106,14 +106,14 @@ impl Evaluator {
                     let square = pieces.trailing_zeros() as usize;
                     pieces &= pieces - 1;
 
-                    // Материальная оценка
+                    // Material evaluation
                     score += sign * PIECE_VALUES[piece_type];
 
-                    // Позиционная оценка
+                    // Positional evaluation
                     let sq = if color == Color::White {
                         square
                     } else {
-                        square ^ 56 // Зеркалируем для черных
+                        square ^ 56 // Mirror for black
                     };
 
                     let positional_bonus = match piece_type {
@@ -137,7 +137,7 @@ impl Evaluator {
             }
         }
 
-        // Бонус за пару слонов
+        // Bishop pair bonus
         let white_bishops = board.pieces[0][Piece::Bishop as usize].count_ones();
         let black_bishops = board.pieces[1][Piece::Bishop as usize].count_ones();
         if white_bishops >= 2 {
@@ -147,14 +147,11 @@ impl Evaluator {
             score -= 50;
         }
 
-        // Penalty за сдвоенные пешки
+        // Pawn structure penalty
         score += Self::evaluate_pawn_structure(board, Color::White);
         score -= Self::evaluate_pawn_structure(board, Color::Black);
 
-        // Бонус за мобильность (упрощенная версия)
-        // В полной версии нужно генерировать все ходы
-
-        // Возвращаем оценку с точки зрения стороны, которая ходит
+        // Return score from side to move perspective
         if board.side_to_move == Color::White {
             score
         } else {
@@ -163,14 +160,14 @@ impl Evaluator {
     }
 
     fn is_endgame(board: &Board) -> bool {
-        // Определяем эндшпиль по количеству материала
+        // Determine endgame by material count
         let mut total_material = 0;
         for color in 0..2 {
-            for piece_type in 1..5 {  // Не считаем пешки и короля
+            for piece_type in 1..5 {  // Don't count pawns and king
                 total_material += board.pieces[color][piece_type].count_ones();
             }
         }
-        total_material <= 6  // Простая эвристика
+        total_material <= 6  // Simple heuristic
     }
 
     fn evaluate_pawn_structure(board: &Board, color: Color) -> i32 {
@@ -178,7 +175,7 @@ impl Evaluator {
         let color_idx = color as usize;
         let pawns = board.pieces[color_idx][Piece::Pawn as usize];
 
-        // Проверяем сдвоенные пешки на каждой вертикали
+        // Check for doubled pawns on each file
         for file in 0..8 {
             let mut file_mask = 0u64;
             for rank in 0..8 {
@@ -190,8 +187,8 @@ impl Evaluator {
             }
         }
 
-        // Бонус за проходные пешки (упрощенная версия)
-        // В полной версии нужно проверять, нет ли вражеских пешек впереди
+        // Bonus for passed pawns (simplified version)
+        // Full version needs to check for enemy pawns ahead
 
         score
     }
