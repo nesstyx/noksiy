@@ -46,7 +46,7 @@ impl UciEngine {
     }
 
     fn uci(&self) {
-        println!("id name Noksiy 0.2.0");
+        println!("id name Noksiy 0.3.0");
         println!("id author nesstyx & Claude (AI-generated)");
         println!("option name Hash type spin default 128 min 1 max 1024");
         println!("uciok");

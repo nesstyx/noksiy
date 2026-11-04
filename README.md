@@ -16,11 +16,14 @@ Noksiy is a high-performance chess engine written entirely in Rust and **complet
 
 - ⚡ **Bitboard representation** - lightning-fast position processing
 - 🧠 **Alpha-Beta pruning** with advanced enhancements
-- 🎯 **Iterative deepening** - optimal time management
-- 📊 **Piece-Square Tables** - positional evaluation
-- 🔪 **Quiescence search** - tactical accuracy
-- 🎲 **Move ordering** - MVV-LVA, killer moves, history heuristic
+- 🎯 **Iterative deepening** with aspiration windows
+- 📊 **Advanced evaluation** - material, position, mobility, center control
+- 🔪 **Quiescence search** with delta pruning
+- 🎲 **Smart move ordering** - TT move, MVV-LVA, killer moves, history heuristic
 - 💾 **Transposition Table** - position caching with Zobrist hashing
+- ⚡ **Null Move Pruning** - massive search tree reduction
+- 🎯 **Late Move Reductions (LMR)** - intelligent depth reduction
+- 📈 **Principal Variation tracking** - best line visualization
 - 🎮 **UCI protocol** - compatible with all chess GUIs
 - 🤖 **100% AI-generated code** - no human-written chess logic
 
@@ -76,28 +79,45 @@ src/
 
 ### Search
 - **Alpha-Beta Pruning** - efficient tree pruning
-- **Iterative Deepening** - progressive depth increase
-- **Quiescence Search** - tactical stability
-- **Move Ordering** - MVV-LVA, killer moves, history heuristic
+- **Null Move Pruning** - skip opponent's move to prove position is strong
+- **Late Move Reductions (LMR)** - reduce depth for unlikely moves
+- **Iterative Deepening** with aspiration windows
+- **Quiescence Search** with delta pruning
+- **Principal Variation (PV) tracking** - best line visualization
+- **Move Ordering** - TT move, MVV-LVA, killer moves, history heuristic
 - **Transposition Table** - position caching with Zobrist hashing
+- **Mate distance pruning** - optimize checkmate detection
 
 ### Evaluation
-- Material balance
+- Material balance with optimized piece values
 - Positional bonuses (Piece-Square Tables)
-- Pawn structure (doubled, passed pawns)
+- Pawn structure (doubled, isolated, passed pawns)
 - Bishop pair bonus
-- Endgame vs middlegame distinction
+- Center control evaluation
+- Piece mobility scoring
+- Rooks on open/semi-open files
+- Game phase interpolation (middlegame vs endgame)
 
 ## Roadmap
 
 - [x] Bitboard representation
 - [x] Alpha-Beta pruning
-- [x] Quiescence search
+- [x] Quiescence search with delta pruning
 - [x] Transposition Table with Zobrist hashing
-- [ ] Null Move Pruning
-- [ ] Late Move Reductions (LMR)
+- [x] Null Move Pruning
+- [x] Late Move Reductions (LMR)
+- [x] Aspiration windows
+- [x] Principal Variation tracking
+- [x] Advanced evaluation (mobility, center control, pawn structure)
 - [ ] Magic Bitboards for sliders
+- [ ] Futility pruning
+- [ ] Razoring
+- [ ] Internal Iterative Deepening
 - [ ] Syzygy Tablebase support
+- [ ] Opening Book
+- [ ] Multi-threading (Lazy SMP)
+- [ ] Tunable evaluation parameters
+- [ ] NNUE evaluation
 - [ ] Opening Book
 - [ ] Multi-threading (Lazy SMP)
 - [ ] Tunable evaluation parameters

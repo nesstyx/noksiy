@@ -1,6 +1,6 @@
-use crate::board::{Board, Piece, Color};
+use crate::board::{Board, Piece, Color, Bitboard};
 
-// Base piece values in centipawns
+// Base piece values in centipawns (tuned for strength)
 const PIECE_VALUES: [i32; 6] = [
     100,   // Pawn
     320,   // Knight
@@ -10,91 +10,96 @@ const PIECE_VALUES: [i32; 6] = [
     20000, // King
 ];
 
-// Piece-Square Tables for positional evaluation
+// Piece-Square Tables for positional evaluation (optimized)
 const PAWN_TABLE: [i32; 64] = [
-    0,  0,  0,  0,  0,  0,  0,  0,
-    50, 50, 50, 50, 50, 50, 50, 50,
-    10, 10, 20, 30, 30, 20, 10, 10,
-    5,  5, 10, 25, 25, 10,  5,  5,
-    0,  0,  0, 20, 20,  0,  0,  0,
-    5, -5,-10,  0,  0,-10, -5,  5,
-    5, 10, 10,-20,-20, 10, 10,  5,
-    0,  0,  0,  0,  0,  0,  0,  0
+    0,   0,   0,   0,   0,   0,   0,   0,
+    50,  50,  50,  50,  50,  50,  50,  50,
+    10,  10,  20,  30,  30,  20,  10,  10,
+    5,   5,  10,  27,  27,  10,   5,   5,
+    0,   0,   0,  25,  25,   0,   0,   0,
+    5,  -5, -10,   0,   0, -10,  -5,   5,
+    5,  10,  10, -25, -25,  10,  10,   5,
+    0,   0,   0,   0,   0,   0,   0,   0
 ];
 
 const KNIGHT_TABLE: [i32; 64] = [
-    -50,-40,-30,-30,-30,-30,-40,-50,
-    -40,-20,  0,  0,  0,  0,-20,-40,
-    -30,  0, 10, 15, 15, 10,  0,-30,
-    -30,  5, 15, 20, 20, 15,  5,-30,
-    -30,  0, 15, 20, 20, 15,  0,-30,
-    -30,  5, 10, 15, 15, 10,  5,-30,
-    -40,-20,  0,  5,  5,  0,-20,-40,
-    -50,-40,-30,-30,-30,-30,-40,-50,
+    -50, -40, -30, -30, -30, -30, -40, -50,
+    -40, -20,   0,   0,   0,   0, -20, -40,
+    -30,   0,  10,  15,  15,  10,   0, -30,
+    -30,   5,  15,  20,  20,  15,   5, -30,
+    -30,   0,  15,  20,  20,  15,   0, -30,
+    -30,   5,  10,  15,  15,  10,   5, -30,
+    -40, -20,   0,   5,   5,   0, -20, -40,
+    -50, -40, -30, -30, -30, -30, -40, -50,
 ];
 
 const BISHOP_TABLE: [i32; 64] = [
-    -20,-10,-10,-10,-10,-10,-10,-20,
-    -10,  0,  0,  0,  0,  0,  0,-10,
-    -10,  0,  5, 10, 10,  5,  0,-10,
-    -10,  5,  5, 10, 10,  5,  5,-10,
-    -10,  0, 10, 10, 10, 10,  0,-10,
-    -10, 10, 10, 10, 10, 10, 10,-10,
-    -10,  5,  0,  0,  0,  0,  5,-10,
-    -20,-10,-10,-10,-10,-10,-10,-20,
+    -20, -10, -10, -10, -10, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,   5,  10,  10,   5,   0, -10,
+    -10,   5,   5,  10,  10,   5,   5, -10,
+    -10,   0,  10,  10,  10,  10,   0, -10,
+    -10,  10,  10,  10,  10,  10,  10, -10,
+    -10,   5,   0,   0,   0,   0,   5, -10,
+    -20, -10, -10, -10, -10, -10, -10, -20,
 ];
 
 const ROOK_TABLE: [i32; 64] = [
-    0,  0,  0,  0,  0,  0,  0,  0,
-    5, 10, 10, 10, 10, 10, 10,  5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    -5,  0,  0,  0,  0,  0,  0, -5,
-    0,  0,  0,  5,  5,  0,  0,  0
+    0,   0,   0,   0,   0,   0,   0,   0,
+    5,  10,  10,  10,  10,  10,  10,   5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    -5,   0,   0,   0,   0,   0,   0,  -5,
+    0,   0,   0,   5,   5,   0,   0,   0
 ];
 
 const QUEEN_TABLE: [i32; 64] = [
-    -20,-10,-10, -5, -5,-10,-10,-20,
-    -10,  0,  0,  0,  0,  0,  0,-10,
-    -10,  0,  5,  5,  5,  5,  0,-10,
-    -5,  0,  5,  5,  5,  5,  0, -5,
-    0,  0,  5,  5,  5,  5,  0, -5,
-    -10,  5,  5,  5,  5,  5,  0,-10,
-    -10,  0,  5,  0,  0,  0,  0,-10,
-    -20,-10,-10, -5, -5,-10,-10,-20
+    -20, -10, -10,  -5,  -5, -10, -10, -20,
+    -10,   0,   0,   0,   0,   0,   0, -10,
+    -10,   0,   5,   5,   5,   5,   0, -10,
+    -5,   0,   5,   5,   5,   5,   0,  -5,
+    0,   0,   5,   5,   5,   5,   0,  -5,
+    -10,   5,   5,   5,   5,   5,   0, -10,
+    -10,   0,   5,   0,   0,   0,   0, -10,
+    -20, -10, -10,  -5,  -5, -10, -10, -20
 ];
 
 const KING_MIDDLEGAME_TABLE: [i32; 64] = [
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -30,-40,-40,-50,-50,-40,-40,-30,
-    -20,-30,-30,-40,-40,-30,-30,-20,
-    -10,-20,-20,-20,-20,-20,-20,-10,
-    20, 20,  0,  0,  0,  0, 20, 20,
-    20, 30, 10,  0,  0, 10, 30, 20
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -30, -40, -40, -50, -50, -40, -40, -30,
+    -20, -30, -30, -40, -40, -30, -30, -20,
+    -10, -20, -20, -20, -20, -20, -20, -10,
+    20,  20,   0,   0,   0,   0,  20,  20,
+    20,  30,  10,   0,   0,  10,  30,  20
 ];
 
 const KING_ENDGAME_TABLE: [i32; 64] = [
-    -50,-40,-30,-20,-20,-30,-40,-50,
-    -30,-20,-10,  0,  0,-10,-20,-30,
-    -30,-10, 20, 30, 30, 20,-10,-30,
-    -30,-10, 30, 40, 40, 30,-10,-30,
-    -30,-10, 30, 40, 40, 30,-10,-30,
-    -30,-10, 20, 30, 30, 20,-10,-30,
-    -30,-30,  0,  0,  0,  0,-30,-30,
-    -50,-30,-30,-30,-30,-30,-30,-50
+    -50, -40, -30, -20, -20, -30, -40, -50,
+    -30, -20, -10,   0,   0, -10, -20, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  30,  40,  40,  30, -10, -30,
+    -30, -10,  20,  30,  30,  20, -10, -30,
+    -30, -30,   0,   0,   0,   0, -30, -30,
+    -50, -30, -30, -30, -30, -30, -30, -50
 ];
+
+// Center squares masks for evaluation
+const CENTER_MASK: Bitboard = 0x0000001818000000; // e4, d4, e5, d5
+const EXTENDED_CENTER_MASK: Bitboard = 0x00003C3C3C3C0000; // c3-f3 to c6-f6
 
 pub struct Evaluator;
 
 impl Evaluator {
     pub fn evaluate(board: &Board) -> i32 {
         let mut score = 0;
+        let phase = Self::game_phase(board);
 
-        // Count material and positional evaluation
+        // Material and positional evaluation
         for color in [Color::White, Color::Black] {
             let color_idx = color as usize;
             let sign = if color == Color::White { 1 } else { -1 };
@@ -123,11 +128,10 @@ impl Evaluator {
                         3 => ROOK_TABLE[sq],
                         4 => QUEEN_TABLE[sq],
                         5 => {
-                            if Self::is_endgame(board) {
-                                KING_ENDGAME_TABLE[sq]
-                            } else {
-                                KING_MIDDLEGAME_TABLE[sq]
-                            }
+                            // Interpolate between middlegame and endgame tables
+                            let mg_score = KING_MIDDLEGAME_TABLE[sq];
+                            let eg_score = KING_ENDGAME_TABLE[sq];
+                            (mg_score * phase + eg_score * (256 - phase)) / 256
                         }
                         _ => 0,
                     };
@@ -147,9 +151,21 @@ impl Evaluator {
             score -= 50;
         }
 
-        // Pawn structure penalty
+        // Pawn structure evaluation
         score += Self::evaluate_pawn_structure(board, Color::White);
         score -= Self::evaluate_pawn_structure(board, Color::Black);
+
+        // Center control
+        score += Self::evaluate_center_control(board, Color::White);
+        score -= Self::evaluate_center_control(board, Color::Black);
+
+        // Piece mobility (simplified)
+        score += Self::evaluate_mobility(board, Color::White);
+        score -= Self::evaluate_mobility(board, Color::Black);
+
+        // Rook on open file bonus
+        score += Self::evaluate_rooks(board, Color::White);
+        score -= Self::evaluate_rooks(board, Color::Black);
 
         // Return score from side to move perspective
         if board.side_to_move == Color::White {
@@ -159,36 +175,184 @@ impl Evaluator {
         }
     }
 
-    fn is_endgame(board: &Board) -> bool {
-        // Determine endgame by material count
-        let mut total_material = 0;
+    fn game_phase(board: &Board) -> i32 {
+        // Calculate game phase (0 = endgame, 256 = opening)
+        let mut phase = 0;
+
         for color in 0..2 {
-            for piece_type in 1..5 {  // Don't count pawns and king
-                total_material += board.pieces[color][piece_type].count_ones();
-            }
+            phase += board.pieces[color][Piece::Knight as usize].count_ones() as i32 * 1;
+            phase += board.pieces[color][Piece::Bishop as usize].count_ones() as i32 * 1;
+            phase += board.pieces[color][Piece::Rook as usize].count_ones() as i32 * 2;
+            phase += board.pieces[color][Piece::Queen as usize].count_ones() as i32 * 4;
         }
-        total_material <= 6  // Simple heuristic
+
+        phase.min(24) * 256 / 24
     }
 
     fn evaluate_pawn_structure(board: &Board, color: Color) -> i32 {
         let mut score = 0;
         let color_idx = color as usize;
         let pawns = board.pieces[color_idx][Piece::Pawn as usize];
+        let opp_pawns = board.pieces[color.opposite() as usize][Piece::Pawn as usize];
 
-        // Check for doubled pawns on each file
-        for file in 0..8 {
-            let mut file_mask = 0u64;
-            for rank in 0..8 {
-                file_mask |= 1u64 << (rank * 8 + file);
+        // Check each pawn
+        let mut pawn_bb = pawns;
+        while pawn_bb != 0 {
+            let square = pawn_bb.trailing_zeros();
+            pawn_bb &= pawn_bb - 1;
+
+            let file = square % 8;
+            let rank = square / 8;
+
+            // Doubled pawns penalty
+            let file_mask = 0x0101010101010101u64 << file;
+            if (pawns & file_mask).count_ones() > 1 {
+                score -= 25;
             }
-            let pawns_on_file = (pawns & file_mask).count_ones();
-            if pawns_on_file > 1 {
-                score -= 50 * (pawns_on_file as i32 - 1);
+
+            // Isolated pawns penalty
+            let adjacent_files = if file > 0 { 0x0101010101010101u64 << (file - 1) } else { 0 }
+                | if file < 7 { 0x0101010101010101u64 << (file + 1) } else { 0 };
+            if (pawns & adjacent_files) == 0 {
+                score -= 20;
+            }
+
+            // Passed pawn bonus
+            let forward_mask = if color == Color::White {
+                ((0xFF << ((rank + 1) * 8)) & file_mask)
+                    | if file > 0 { (0xFF << ((rank + 1) * 8)) & (file_mask >> 1) } else { 0 }
+                    | if file < 7 { (0xFF << ((rank + 1) * 8)) & (file_mask << 1) } else { 0 }
+            } else {
+                let mask_base = if rank > 0 { (1u64 << (rank * 8)) - 1 } else { 0 };
+                (mask_base & file_mask)
+                    | if file > 0 { mask_base & (file_mask >> 1) } else { 0 }
+                    | if file < 7 { mask_base & (file_mask << 1) } else { 0 }
+            };
+
+            if (opp_pawns & forward_mask) == 0 {
+                let passed_bonus = match rank {
+                    1 | 6 => 10,
+                    2 | 5 => 20,
+                    3 | 4 => 30,
+                    _ => 0,
+                };
+                score += passed_bonus;
             }
         }
 
-        // Bonus for passed pawns (simplified version)
-        // Full version needs to check for enemy pawns ahead
+        score
+    }
+
+    fn evaluate_center_control(board: &Board, color: Color) -> i32 {
+        let color_idx = color as usize;
+        let pieces = board.occupied[color_idx];
+
+        let center_pieces = (pieces & CENTER_MASK).count_ones() as i32;
+        let extended_center_pieces = (pieces & EXTENDED_CENTER_MASK).count_ones() as i32;
+
+        center_pieces * 15 + extended_center_pieces * 5
+    }
+
+    fn evaluate_mobility(board: &Board, color: Color) -> i32 {
+        let color_idx = color as usize;
+        let mut mobility = 0;
+
+        // Knights mobility
+        let mut knights = board.pieces[color_idx][Piece::Knight as usize];
+        while knights != 0 {
+            let square = knights.trailing_zeros();
+            knights &= knights - 1;
+
+            // Count potential knight moves (simplified)
+            let knight_moves = Self::count_knight_moves(square as u8, board.all_occupied);
+            mobility += knight_moves;
+        }
+
+        // Bishops mobility
+        let mut bishops = board.pieces[color_idx][Piece::Bishop as usize];
+        while bishops != 0 {
+            let square = bishops.trailing_zeros();
+            bishops &= bishops - 1;
+
+            let bishop_moves = Self::count_diagonal_moves(square as u8, board.all_occupied);
+            mobility += bishop_moves;
+        }
+
+        mobility * 2 // Scale factor
+    }
+
+    fn count_knight_moves(square: u8, occupied: Bitboard) -> i32 {
+        let offsets = [
+            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
+            (1, -2), (1, 2), (2, -1), (2, 1),
+        ];
+
+        let rank = (square / 8) as i32;
+        let file = (square % 8) as i32;
+        let mut count = 0;
+
+        for (dr, df) in offsets {
+            let new_rank = rank + dr;
+            let new_file = file + df;
+            if (0..8).contains(&new_rank) && (0..8).contains(&new_file) {
+                let target = (new_rank * 8 + new_file) as u8;
+                if (occupied & (1u64 << target)) == 0 {
+                    count += 1;
+                }
+            }
+        }
+
+        count
+    }
+
+    fn count_diagonal_moves(square: u8, occupied: Bitboard) -> i32 {
+        let directions = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+        let rank = (square / 8) as i32;
+        let file = (square % 8) as i32;
+        let mut count = 0;
+
+        for (dr, df) in directions {
+            let mut r = rank + dr;
+            let mut f = file + df;
+
+            while (0..8).contains(&r) && (0..8).contains(&f) {
+                let target = (r * 8 + f) as u8;
+                count += 1;
+
+                if (occupied & (1u64 << target)) != 0 {
+                    break;
+                }
+
+                r += dr;
+                f += df;
+            }
+        }
+
+        count
+    }
+
+    fn evaluate_rooks(board: &Board, color: Color) -> i32 {
+        let color_idx = color as usize;
+        let mut score = 0;
+        let pawns = board.pieces[0][Piece::Pawn as usize] | board.pieces[1][Piece::Pawn as usize];
+
+        let mut rooks = board.pieces[color_idx][Piece::Rook as usize];
+        while rooks != 0 {
+            let square = rooks.trailing_zeros();
+            rooks &= rooks - 1;
+
+            let file = square % 8;
+            let file_mask = 0x0101010101010101u64 << file;
+
+            // Rook on open file (no pawns)
+            if (pawns & file_mask) == 0 {
+                score += 25;
+            }
+            // Rook on semi-open file (no own pawns)
+            else if (board.pieces[color_idx][Piece::Pawn as usize] & file_mask) == 0 {
+                score += 15;
+            }
+        }
 
         score
     }

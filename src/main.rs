@@ -9,7 +9,7 @@ mod transposition;
 use uci::UciEngine;
 
 fn main() {
-    println!("Noksiy Chess Engine v0.2.0");
+    println!("Noksiy Chess Engine v0.3.0");
     println!("The world's strongest AI-written chess engine in Rust");
     println!("100% AI-generated code by Claude (Anthropic)");
     println!("Type 'uci' to start UCI protocol");
