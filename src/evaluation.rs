@@ -168,11 +168,11 @@ impl Evaluator {
         score += Self::evaluate_rooks(board, Color::White);
         score -= Self::evaluate_rooks(board, Color::Black);
 
-        // Return score from side to move perspective
+        // Return score from side to move perspective (+ небольшой бонус за право хода)
         if board.side_to_move == Color::White {
-            score
+            score + 10
         } else {
-            -score
+            -score + 10
         }
     }
 
@@ -219,25 +219,19 @@ impl Evaluator {
             }
 
             // Passed pawn bonus
-            let forward_mask = if color == Color::White {
-                ((0xFF << ((rank + 1) * 8)) & file_mask)
-                    | if file > 0 { (0xFF << ((rank + 1) * 8)) & (file_mask >> 1) } else { 0 }
-                    | if file < 7 { (0xFF << ((rank + 1) * 8)) & (file_mask << 1) } else { 0 }
+            // Все поля впереди пешки (по направлению её движения)
+            let ahead: u64 = if color == Color::White {
+                if rank >= 7 { 0 } else { !0u64 << ((rank + 1) * 8) }
             } else {
-                let mask_base = if rank > 0 { (1u64 << (rank * 8)) - 1 } else { 0 };
-                (mask_base & file_mask)
-                    | if file > 0 { mask_base & (file_mask >> 1) } else { 0 }
-                    | if file < 7 { mask_base & (file_mask << 1) } else { 0 }
+                (1u64 << (rank * 8)) - 1
             };
+            let forward_mask = ahead & (file_mask | adjacent_files);
 
             if (opp_pawns & forward_mask) == 0 {
-                let passed_bonus = match rank {
-                    1 | 6 => 10,
-                    2 | 5 => 20,
-                    3 | 4 => 30,
-                    _ => 0,
-                };
-                score += passed_bonus;
+                // Бонус зависит от продвижения пешки с её собственной стороны
+                let rel_rank = (if color == Color::White { rank } else { 7 - rank }) as usize;
+                const PASSED_BONUS: [i32; 8] = [0, 5, 10, 20, 35, 60, 100, 0];
+                score += PASSED_BONUS[rel_rank];
             }
         }
 
@@ -279,7 +273,10 @@ impl Evaluator {
             mobility += bishop_moves;
         }
 
-        mobility * 2 // Scale factor
+        // Вычитаем «нормальную» подвижность, чтобы бонус считался от базового уровня
+        let minor_count = (board.pieces[color_idx][Piece::Knight as usize]
+            | board.pieces[color_idx][Piece::Bishop as usize]).count_ones() as i32;
+        (mobility - minor_count * 6) * 3 // Scale factor
     }
 
     fn count_knight_moves(square: u8, occupied: Bitboard) -> i32 {

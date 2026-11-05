@@ -1,4 +1,4 @@
-use crate::board::{Board, Move};
+use crate::board::{Board, Move, Piece};
 use crate::movegen::MoveGenerator;
 use crate::evaluation::Evaluator;
 use crate::zobrist::Zobrist;
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 const MAX_DEPTH: u8 = 64;
 const INFINITY: i32 = 1_000_000;
 const MATE_SCORE: i32 = 900_000;
+const MATE_BOUND: i32 = MATE_SCORE - 1000; // всё, что дальше этой границы, считаем матовым счётом
 
 // Null Move Pruning parameters
 const NULL_MOVE_REDUCTION: u8 = 2;
@@ -17,13 +18,19 @@ const NULL_MOVE_MIN_DEPTH: u8 = 3;
 // Late Move Reductions parameters
 const LMR_MIN_DEPTH: u8 = 3;
 const LMR_FULL_DEPTH_MOVES: usize = 4;
-const LMR_REDUCTION_LIMIT: u8 = 3;
 
 // Futility Pruning margins
 const FUTILITY_MARGIN: [i32; 4] = [0, 200, 300, 500];
 
 // Razoring margins
 const RAZOR_MARGIN: [i32; 4] = [0, 300, 400, 600];
+
+// Reverse futility (static null move) — маржа за единицу глубины
+const RFP_MARGIN: i32 = 100;
+const RFP_MAX_DEPTH: u8 = 5;
+
+// Верхняя граница для таблицы истории (чтобы она не перебивала взятия и киллеры)
+const HISTORY_LIMIT: i32 = 400_000;
 
 pub struct SearchInfo {
     pub nodes: u64,
@@ -42,6 +49,7 @@ impl SearchInfo {
         }
     }
 
+    /// Полная проверка (используется вне горячего пути)
     pub fn should_stop(&self) -> bool {
         if self.stop {
             return true;
@@ -53,6 +61,23 @@ impl SearchInfo {
         }
         false
     }
+
+    /// Дешёвая проверка для горячего пути: часы читаем раз в 2048 узлов,
+    /// а при истечении времени взводим флаг `stop`, который уже не сбрасывается.
+    #[inline]
+    fn poll(&mut self) -> bool {
+        if self.stop {
+            return true;
+        }
+        if self.nodes & 2047 == 0 {
+            if let Some(limit) = self.time_limit {
+                if self.start_time.elapsed() >= limit {
+                    self.stop = true;
+                }
+            }
+        }
+        self.stop
+    }
 }
 
 pub struct Search {
@@ -62,6 +87,8 @@ pub struct Search {
     history_table: [[i32; 64]; 64], // [from][to]
     pv_table: [[Option<Move>; MAX_DEPTH as usize]; MAX_DEPTH as usize], // Principal Variation
     pv_length: [usize; MAX_DEPTH as usize],
+    path: [u64; MAX_DEPTH as usize], // хэши позиций на текущей ветке (для повторений)
+    root_depth: u8,
 }
 
 impl Search {
@@ -73,6 +100,8 @@ impl Search {
             history_table: [[0; 64]; 64],
             pv_table: [[None; MAX_DEPTH as usize]; MAX_DEPTH as usize],
             pv_length: [0; MAX_DEPTH as usize],
+            path: [0; MAX_DEPTH as usize],
+            root_depth: 0,
         }
     }
 
@@ -80,10 +109,20 @@ impl Search {
         let mut info = SearchInfo::new();
         info.time_limit = time_limit;
 
+        let depth = depth.min(MAX_DEPTH - 4);
+
         let mut best_move = None;
         let mut best_score;
 
         self.tt.new_search();
+
+        // Киллеры устаревают между ходами, историю старим (делим пополам)
+        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
+        for row in self.history_table.iter_mut() {
+            for h in row.iter_mut() {
+                *h /= 2;
+            }
+        }
 
         // Iterative deepening with aspiration windows
         let mut prev_score = 0;
@@ -92,6 +131,18 @@ impl Search {
             if info.should_stop() {
                 break;
             }
+
+            // Не начинаем новую итерацию, если съедено >60% времени:
+            // следующая итерация всё равно не успеет закончиться
+            if current_depth > 1 && best_move.is_some() {
+                if let Some(limit) = info.time_limit {
+                    if info.start_time.elapsed() * 10 >= limit * 6 {
+                        break;
+                    }
+                }
+            }
+
+            self.root_depth = current_depth;
 
             // Aspiration window for depths > 4
             let (mut alpha, mut beta) = if current_depth >= 5 {
@@ -159,6 +210,28 @@ impl Search {
         best_move
     }
 
+    #[inline]
+    fn score_to_tt(score: i32, ply: u8) -> i32 {
+        if score >= MATE_BOUND {
+            score + ply as i32
+        } else if score <= -MATE_BOUND {
+            score - ply as i32
+        } else {
+            score
+        }
+    }
+
+    #[inline]
+    fn score_from_tt(score: i32, ply: u8) -> i32 {
+        if score >= MATE_BOUND {
+            score - ply as i32
+        } else if score <= -MATE_BOUND {
+            score + ply as i32
+        } else {
+            score
+        }
+    }
+
     fn search(&mut self, board: &Board, depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
         info.nodes += 1;
 
@@ -171,7 +244,7 @@ impl Search {
             return Evaluator::evaluate(board);
         }
 
-        if info.should_stop() {
+        if info.poll() {
             return 0;
         }
 
@@ -184,6 +257,12 @@ impl Search {
         let hash = Zobrist::hash(board);
         let in_check = board.in_check();
 
+        // Повторение позиции внутри текущей ветки — считаем ничьёй
+        self.path[ply as usize] = hash;
+        if ply > 0 && self.path[..ply as usize].contains(&hash) {
+            return 0;
+        }
+
         // Mate distance pruning
         alpha = alpha.max(-MATE_SCORE + ply as i32);
         beta = beta.min(MATE_SCORE - ply as i32 - 1);
@@ -193,30 +272,48 @@ impl Search {
 
         // Transposition table probe
         if let Some(tt_score) = self.tt.probe(hash, depth, alpha, beta) {
-            if !is_pv_node {
-                return tt_score;
+            if !is_pv_node && ply > 0 {
+                return Self::score_from_tt(tt_score, ply);
             }
         }
 
         // Quiescence search at leaf nodes
         if depth == 0 {
-            return self.quiescence(board, alpha, beta, info);
+            return self.quiescence(board, alpha, beta, ply, info);
         }
 
-        // Null Move Pruning - skip if in check or in endgame
+        // Статическая оценка считается один раз и используется всеми отсечениями
+        let static_eval = if in_check { -INFINITY } else { Evaluator::evaluate(board) };
+
+        // Reverse futility pruning: позиция настолько хороша, что даже с запасом выше beta
+        if !is_pv_node
+            && !in_check
+            && depth <= RFP_MAX_DEPTH
+            && beta.abs() < MATE_BOUND
+            && static_eval - RFP_MARGIN * depth as i32 >= beta
+        {
+            return static_eval - RFP_MARGIN * depth as i32;
+        }
+
+        // Null Move Pruning - skip if in check or no non-pawn material (zugzwang)
         if do_null
+            && ply > 0
             && !in_check
             && depth >= NULL_MOVE_MIN_DEPTH
-            && !self.is_endgame(board)
-            && beta < MATE_SCORE - 100
+            && static_eval >= beta
+            && self.has_non_pawn_material(board)
+            && beta.abs() < MATE_BOUND
         {
             let mut null_board = *board;
             null_board.side_to_move = null_board.side_to_move.opposite();
             null_board.en_passant_square = None;
 
+            // Адаптивная редукция: чем глубже, тем больше режем
+            let r = NULL_MOVE_REDUCTION + depth / 4;
+
             let null_score = -self.search(
                 &null_board,
-                depth.saturating_sub(NULL_MOVE_REDUCTION + 1),
+                depth.saturating_sub(r + 1),
                 -beta,
                 -beta + 1,
                 ply + 1,
@@ -224,9 +321,13 @@ impl Search {
                 info
             );
 
+            if info.stop {
+                return 0;
+            }
+
             if null_score >= beta {
-                // Null move cutoff
-                return beta;
+                // Null move cutoff (матовые счета из null move не доверяем)
+                return if null_score >= MATE_BOUND { beta } else { null_score.min(beta) };
             }
         }
 
@@ -236,11 +337,13 @@ impl Search {
             && depth <= 3
             && depth > 0
         {
-            let static_eval = Evaluator::evaluate(board);
             let razor_margin = RAZOR_MARGIN[depth as usize];
 
             if static_eval + razor_margin < alpha {
-                let qscore = self.quiescence(board, alpha - razor_margin, alpha - razor_margin + 1, info);
+                let qscore = self.quiescence(board, alpha - razor_margin, alpha - razor_margin + 1, ply, info);
+                if info.stop {
+                    return 0;
+                }
                 if qscore + razor_margin <= alpha {
                     return qscore;
                 }
@@ -259,11 +362,10 @@ impl Search {
         }
 
         // Move ordering for better pruning
-        let ordered_moves = self.order_moves(moves, depth, hash, ply);
+        let ordered_moves = self.order_moves(moves, hash, ply);
 
         let mut best_move = None;
         let original_alpha = alpha;
-        let mut _moves_searched = 0;
 
         for (move_num, mv) in ordered_moves.iter().enumerate() {
             let mut new_board = *board;
@@ -271,9 +373,13 @@ impl Search {
 
             let mut score;
             let gives_check = new_board.in_check();
+            let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
 
-            // Check extension - extend search when giving check
-            let extension = if gives_check && depth < MAX_DEPTH - 1 {
+            // Check extension — ограничиваем, чтобы цепочки шахов не раздували дерево
+            let extension: u8 = if gives_check
+                && depth < MAX_DEPTH - 1
+                && ply < self.root_depth.saturating_mul(2)
+            {
                 1
             } else {
                 0
@@ -284,25 +390,19 @@ impl Search {
                 && !in_check
                 && !gives_check
                 && depth <= 3
-                && depth > 0
-                && mv.captured.is_none()
-                && mv.promotion.is_none()
-                && move_num >= LMR_FULL_DEPTH_MOVES
+                && is_quiet
+                && move_num > 0
+                && alpha.abs() < MATE_BOUND
             {
-                let static_eval = if move_num == 0 {
-                    Evaluator::evaluate(board)
-                } else {
-                    alpha
-                };
-
-                let futility_margin = FUTILITY_MARGIN[depth as usize];
-                if static_eval + futility_margin <= alpha {
+                if static_eval + FUTILITY_MARGIN[depth as usize] <= alpha {
                     continue; // Skip this move
                 }
             }
 
-            // SEE pruning for bad captures
-            if move_num > 0
+            // SEE pruning for bad captures (только в непервичных узлах, чтобы не резать жертвы в PV)
+            if !is_pv_node
+                && move_num > 0
+                && depth <= 5
                 && mv.captured.is_some()
                 && !gives_check
                 && !in_check
@@ -313,18 +413,34 @@ impl Search {
                 }
             }
 
-            // Late Move Reductions (LMR)
-            if move_num >= LMR_FULL_DEPTH_MOVES
-                && depth >= LMR_MIN_DEPTH
-                && !in_check
-                && !gives_check
-                && mv.captured.is_none()
-                && mv.promotion.is_none()
-            {
-                // Reduce late moves
-                let reduction = ((move_num as u8).min(LMR_REDUCTION_LIMIT)).min(depth - 1);
+            if move_num == 0 {
+                // Первый ход (обычно ход из TT) — полное окно
+                score = -self.search(
+                    &new_board,
+                    depth - 1 + extension,
+                    -beta,
+                    -alpha,
+                    ply + 1,
+                    true,
+                    info
+                );
+            } else {
+                // Late Move Reductions (LMR)
+                let mut reduction: u8 = 0;
+                if move_num >= LMR_FULL_DEPTH_MOVES
+                    && depth >= LMR_MIN_DEPTH
+                    && !in_check
+                    && !gives_check
+                    && is_quiet
+                {
+                    let mut r = (0.7 + (depth as f32).ln() * ((move_num + 1) as f32).ln() / 2.25) as u8;
+                    if is_pv_node {
+                        r = r.saturating_sub(1);
+                    }
+                    reduction = r.max(1).min(depth - 1);
+                }
 
-                // Search with reduced depth
+                // PVS: сначала нулевое окно (с редукцией, если она есть)
                 score = -self.search(
                     &new_board,
                     depth - 1 - reduction + extension,
@@ -335,8 +451,21 @@ impl Search {
                     info
                 );
 
-                // If LMR suggests this move is good, re-search at full depth
-                if score > alpha {
+                // Редуцированный поиск «понравился» — проверяем на полной глубине
+                if score > alpha && reduction > 0 {
+                    score = -self.search(
+                        &new_board,
+                        depth - 1 + extension,
+                        -alpha - 1,
+                        -alpha,
+                        ply + 1,
+                        true,
+                        info
+                    );
+                }
+
+                // Ход улучшает alpha в PV-узле — перепроверка с полным окном
+                if score > alpha && score < beta {
                     score = -self.search(
                         &new_board,
                         depth - 1 + extension,
@@ -347,30 +476,31 @@ impl Search {
                         info
                     );
                 }
-            } else {
-                // Full depth search for important moves
-                score = -self.search(
-                    &new_board,
-                    depth - 1 + extension,
-                    -beta,
-                    -alpha,
-                    ply + 1,
-                    true,
-                    info
-                );
             }
 
-            _moves_searched += 1;
+            // Поиск был прерван по времени — результат мусорный, ничего не сохраняем (ни в TT, ни в историю)
+            if info.stop {
+                return 0;
+            }
 
             if score >= beta {
                 // Beta cutoff
                 if mv.captured.is_none() {
                     self.store_killer_move(*mv, ply);
                     // i32 вместо u8: (depth * depth) в u8 переполняется при depth >= 16
-                    self.history_table[mv.from as usize][mv.to as usize] += (depth as i32) * (depth as i32);
+                    let bonus = (depth as i32) * (depth as i32);
+                    let h = &mut self.history_table[mv.from as usize][mv.to as usize];
+                    *h += bonus;
+                    if *h > HISTORY_LIMIT {
+                        for row in self.history_table.iter_mut() {
+                            for v in row.iter_mut() {
+                                *v /= 2;
+                            }
+                        }
+                    }
                 }
 
-                self.tt.store(hash, depth, beta, NodeType::LowerBound, Some(*mv));
+                self.tt.store(hash, depth, Self::score_to_tt(beta, ply), NodeType::LowerBound, Some(*mv));
                 return beta;
             }
 
@@ -393,50 +523,90 @@ impl Search {
         } else {
             NodeType::UpperBound
         };
-        self.tt.store(hash, depth, alpha, node_type, best_move);
+        self.tt.store(hash, depth, Self::score_to_tt(alpha, ply), node_type, best_move);
 
         alpha
     }
 
-    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32, info: &mut SearchInfo) -> i32 {
+    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32, ply: u8, info: &mut SearchInfo) -> i32 {
         info.nodes += 1;
 
-        let stand_pat = Evaluator::evaluate(board);
-
-        if stand_pat >= beta {
-            return beta;
+        if info.poll() {
+            return 0;
         }
 
-        // Delta pruning - if even capturing queen can't raise alpha
-        const QUEEN_VALUE: i32 = 900;
-        if stand_pat < alpha - QUEEN_VALUE {
-            return alpha;
+        if ply >= MAX_DEPTH - 1 {
+            return Evaluator::evaluate(board);
         }
 
-        if alpha < stand_pat {
-            alpha = stand_pat;
+        let in_check = board.in_check();
+        let mut stand_pat = -INFINITY;
+
+        // Под шахом «стоять» нельзя — надо рассматривать все уклонения
+        if !in_check {
+            stand_pat = Evaluator::evaluate(board);
+
+            if stand_pat >= beta {
+                return beta;
+            }
+
+            // Delta pruning - if even capturing queen can't raise alpha
+            const QUEEN_VALUE: i32 = 900;
+            if stand_pat < alpha - QUEEN_VALUE {
+                return alpha;
+            }
+
+            if alpha < stand_pat {
+                alpha = stand_pat;
+            }
         }
 
-        // Generate only captures for quiescence search
         let moves = self.movegen.generate_moves(board);
-        let mut captures: Vec<Move> = moves.into_iter().filter(|m| m.captured.is_some()).collect();
 
-        // MVV-LVA ordering for captures
+        if in_check && moves.is_empty() {
+            return -MATE_SCORE + ply as i32;
+        }
+
+        let mut captures: Vec<Move> = if in_check {
+            moves
+        } else {
+            // Взятия и превращения в ферзя
+            moves
+                .into_iter()
+                .filter(|m| m.captured.is_some() || matches!(m.promotion, Some(Piece::Queen)))
+                .collect()
+        };
+
+        // MVV-LVA ordering
         captures.sort_by_key(|mv| {
-            let victim_value = if let Some(captured) = mv.captured {
-                captured as i32
-            } else {
-                0
-            };
-            let attacker_value = mv.piece as i32;
-            -(victim_value * 10 - attacker_value)
+            let victim_value = mv.captured.map(Self::piece_value).unwrap_or(0);
+            let attacker_value = Self::piece_value(mv.piece);
+            let promo = if mv.promotion.is_some() { 800 } else { 0 };
+            -(victim_value * 10 - attacker_value / 10 + promo)
         });
 
         for mv in captures {
+            if !in_check {
+                if let Some(victim) = mv.captured {
+                    // Покадровый delta pruning: даже с запасом взятие не дотягивает до alpha
+                    if mv.promotion.is_none() && stand_pat + Self::piece_value(victim) + 200 < alpha {
+                        continue;
+                    }
+                    // Заведомо проигрышные взятия в qsearch не рассматриваем
+                    if mv.promotion.is_none() && SEE::evaluate(board, mv.from, mv.to, mv.piece) < 0 {
+                        continue;
+                    }
+                }
+            }
+
             let mut new_board = *board;
             new_board.make_move(mv);
 
-            let score = -self.quiescence(&new_board, -beta, -alpha, info);
+            let score = -self.quiescence(&new_board, -beta, -alpha, ply + 1, info);
+
+            if info.stop {
+                return 0;
+            }
 
             if score >= beta {
                 return beta;
@@ -450,58 +620,55 @@ impl Search {
         alpha
     }
 
-    fn order_moves(&self, mut moves: Vec<Move>, _depth: u8, hash: u64, ply: u8) -> Vec<Move> {
-        // Sort moves for better alpha-beta pruning
-        moves.sort_by_cached_key(|mv| {
-            let mut score = 0;
+    #[inline]
+    fn piece_value(p: Piece) -> i32 {
+        match p {
+            Piece::Pawn => 100,
+            Piece::Knight => 320,
+            Piece::Bishop => 330,
+            Piece::Rook => 500,
+            Piece::Queen => 900,
+            Piece::King => 20000,
+        }
+    }
 
-            // Highest priority: TT move
-            if let Some(tt_move) = self.tt.get_best_move(hash) {
-                if tt_move.from == mv.from && tt_move.to == mv.to {
-                    return -1_000_000;
+    fn order_moves(&self, mut moves: Vec<Move>, hash: u64, ply: u8) -> Vec<Move> {
+        // Ход из TT ищем один раз, а не для каждого хода в сортировке
+        let tt_move = self.tt.get_best_move(hash);
+
+        moves.sort_by_cached_key(|mv| {
+            // Приоритеты: TT > взятия (MVV-LVA) > превращения > киллеры > история
+            if let Some(tt_mv) = tt_move {
+                if tt_mv.from == mv.from && tt_mv.to == mv.to {
+                    return -10_000_000;
                 }
             }
 
-            // High priority: winning captures (MVV-LVA)
+            let mut score = 0;
+
             if let Some(captured) = mv.captured {
-                let victim_value = match captured {
-                    crate::board::Piece::Pawn => 100,
-                    crate::board::Piece::Knight => 320,
-                    crate::board::Piece::Bishop => 330,
-                    crate::board::Piece::Rook => 500,
-                    crate::board::Piece::Queen => 900,
-                    crate::board::Piece::King => 20000,
-                };
-                let attacker_value = match mv.piece {
-                    crate::board::Piece::Pawn => 100,
-                    crate::board::Piece::Knight => 320,
-                    crate::board::Piece::Bishop => 330,
-                    crate::board::Piece::Rook => 500,
-                    crate::board::Piece::Queen => 900,
-                    crate::board::Piece::King => 20000,
-                };
-                score += 10000 + victim_value - attacker_value;
+                score += 2_000_000 + Self::piece_value(captured) * 10 - Self::piece_value(mv.piece) / 10;
             }
 
-            // Promotions
             if mv.promotion.is_some() {
-                score += 9000;
+                score += 1_900_000;
             }
 
-            // Killer moves
-            if ply < MAX_DEPTH {
-                for killer in &self.killer_moves[ply as usize] {
-                    if let Some(k) = killer {
-                        if k.from == mv.from && k.to == mv.to {
-                            score += 8000;
-                            break;
+            if mv.captured.is_none() {
+                if ply < MAX_DEPTH {
+                    for (i, killer) in self.killer_moves[ply as usize].iter().enumerate() {
+                        if let Some(k) = killer {
+                            if k.from == mv.from && k.to == mv.to {
+                                score += 1_000_000 - (i as i32) * 100_000;
+                                break;
+                            }
                         }
                     }
                 }
-            }
 
-            // History heuristic
-            score += self.history_table[mv.from as usize][mv.to as usize];
+                // История всегда меньше киллеров и взятий (ограничена HISTORY_LIMIT)
+                score += self.history_table[mv.from as usize][mv.to as usize].min(HISTORY_LIMIT);
+            }
 
             -score
         });
@@ -526,15 +693,16 @@ impl Search {
         }
     }
 
-    fn is_endgame(&self, board: &Board) -> bool {
-        // Simple endgame detection
-        let mut material = 0;
-        for color in 0..2 {
-            for piece in 1..5 {
-                material += board.pieces[color][piece].count_ones();
+    /// Есть ли у стороны, которая ходит, хоть одна фигура кроме пешек и короля.
+    /// Если нет — null move опасен (цугцванг).
+    fn has_non_pawn_material(&self, board: &Board) -> bool {
+        let side = board.side_to_move as usize;
+        for piece in 1..5 {
+            if board.pieces[side][piece] != 0 {
+                return true;
             }
         }
-        material <= 6
+        false
     }
 
     fn format_pv_line(&self) -> String {
@@ -556,10 +724,10 @@ impl Search {
 
         if let Some(promo) = mv.promotion {
             let promo_char = match promo {
-                crate::board::Piece::Queen => 'q',
-                crate::board::Piece::Rook => 'r',
-                crate::board::Piece::Bishop => 'b',
-                crate::board::Piece::Knight => 'n',
+                Piece::Queen => 'q',
+                Piece::Rook => 'r',
+                Piece::Bishop => 'b',
+                Piece::Knight => 'n',
                 _ => 'q',
             };
             format!("{}{}{}", from, to, promo_char)
@@ -576,6 +744,8 @@ impl Search {
 
     pub fn clear_tt(&mut self) {
         self.tt.clear();
+        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
+        self.history_table = [[0; 64]; 64];
     }
 }
 
