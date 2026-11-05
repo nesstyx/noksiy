@@ -119,7 +119,69 @@ impl MoveGenerator {
         attacks
     }
 
+    /// Только легальные ходы (псевдолегальные + фильтр шаха своему королю)
     pub fn generate_moves(&self, board: &Board) -> Vec<Move> {
+        let mut moves = self.generate_pseudo_legal(board);
+        let us = board.side_to_move;
+        moves.retain(|&mv| {
+            let mut b = *board;
+            b.make_move(mv);
+            let k = b.pieces[us as usize][Piece::King as usize];
+            k == 0 || !b.is_square_attacked(k.trailing_zeros() as u8, us.opposite())
+        });
+        moves
+    }
+
+    fn generate_castling(&self, board: &Board, moves: &mut Vec<Move>) {
+        let us = board.side_to_move;
+        let them = us.opposite();
+        let ui = us as usize;
+        let (ks_bit, qs_bit, ksq): (u8, u8, u8) = if us == Color::White {
+            (0b0001, 0b0010, 4)
+        } else {
+            (0b0100, 0b1000, 60)
+        };
+
+        if board.pieces[ui][Piece::King as usize] & (1u64 << ksq) == 0 {
+            return;
+        }
+        if board.is_square_attacked(ksq, them) {
+            return;
+        }
+        let occ = board.all_occupied;
+        let rooks = board.pieces[ui][Piece::Rook as usize];
+
+        let mk = |to: u8| Move {
+            from: ksq,
+            to,
+            piece: Piece::King,
+            captured: None,
+            promotion: None,
+            is_castle: true,
+            is_en_passant: false,
+        };
+
+        // Короткая
+        if board.castling_rights & ks_bit != 0
+            && rooks & (1u64 << (ksq + 3)) != 0
+            && occ & ((1u64 << (ksq + 1)) | (1u64 << (ksq + 2))) == 0
+            && !board.is_square_attacked(ksq + 1, them)
+            && !board.is_square_attacked(ksq + 2, them)
+        {
+            moves.push(mk(ksq + 2));
+        }
+        // Длинная
+        if board.castling_rights & qs_bit != 0
+            && rooks & (1u64 << (ksq - 4)) != 0
+            && occ & ((1u64 << (ksq - 1)) | (1u64 << (ksq - 2)) | (1u64 << (ksq - 3))) == 0
+            && !board.is_square_attacked(ksq - 1, them)
+            && !board.is_square_attacked(ksq - 2, them)
+        {
+            moves.push(mk(ksq - 2));
+        }
+    }
+
+    fn generate_pseudo_legal(&self, board: &Board) -> Vec<Move> {
         let mut moves = Vec::with_capacity(128);
         let color = board.side_to_move;
         let color_idx = color as usize;
@@ -181,6 +243,8 @@ impl MoveGenerator {
             let attacks = self.king_attacks[from as usize] & !board.occupied[color_idx];
             self.add_moves_from_bitboard(from, attacks, Piece::King, board, &mut moves);
         }
+
+        self.generate_castling(board, &mut moves);
 
         moves
     }

@@ -1,6 +1,22 @@
 // Bitboard representation for maximum performance
 pub type Bitboard = u64;
 
+const FILE_A: u64 = 0x0101010101010101;
+const FILE_H: u64 = 0x8080808080808080;
+
+// Маска прав на рокировку: какие права остаются, если ход затрагивает клетку
+fn castle_mask(sq: u8) -> u8 {
+    match sq {
+        4 => !0b0011u8,
+        0 => !0b0010u8,
+        7 => !0b0001u8,
+        60 => !0b1100u8,
+        56 => !0b1000u8,
+        63 => !0b0100u8,
+        _ => 0xFF,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Piece {
     Pawn,
@@ -159,34 +175,61 @@ impl Board {
     pub fn make_move(&mut self, mv: Move) {
         let from_bb = 1u64 << mv.from;
         let to_bb = 1u64 << mv.to;
-        let color = self.side_to_move as usize;
-        let piece_idx = mv.piece as usize;
+        let us = self.side_to_move as usize;
+        let them = self.side_to_move.opposite() as usize;
 
-        // Remove piece from source
-        self.pieces[color][piece_idx] ^= from_bb;
-        self.occupied[color] ^= from_bb;
-        self.all_occupied ^= from_bb;
+        // Убираем фигуру с исходной клетки
+        self.pieces[us][mv.piece as usize] &= !from_bb;
+        self.occupied[us] &= !from_bb;
+        self.all_occupied &= !from_bb;
 
-        // Handle capture
+        // Взятие (включая en passant)
         if let Some(captured) = mv.captured {
-            let opp_color = self.side_to_move.opposite() as usize;
-            let captured_idx = captured as usize;
-            self.pieces[opp_color][captured_idx] ^= to_bb;
-            self.occupied[opp_color] ^= to_bb;
+            let cap_bb = if mv.is_en_passant {
+                if us == 0 { to_bb >> 8 } else { to_bb << 8 }
+            } else {
+                to_bb
+            };
+            self.pieces[them][captured as usize] &= !cap_bb;
+            self.occupied[them] &= !cap_bb;
+            self.all_occupied &= !cap_bb;
             self.halfmove_clock = 0;
         }
 
-        // Place piece on destination
-        let final_piece = if let Some(promo) = mv.promotion {
-            promo
-        } else {
-            mv.piece
-        };
-        self.pieces[color][final_piece as usize] |= to_bb;
-        self.occupied[color] |= to_bb;
+        // Ставим фигуру
+        let final_piece = mv.promotion.unwrap_or(mv.piece);
+        self.pieces[us][final_piece as usize] |= to_bb;
+        self.occupied[us] |= to_bb;
         self.all_occupied |= to_bb;
 
-        // Update game state
+        // Рокировка: двигаем ладью
+        if mv.is_castle {
+            let (rf, rt) = match mv.to {
+                6 => (7u8, 5u8),
+                2 => (0, 3),
+                62 => (63, 61),
+                58 => (56, 59),
+                _ => (0, 0),
+            };
+            let rb = (1u64 << rf) | (1u64 << rt);
+            self.pieces[us][Piece::Rook as usize] ^= rb;
+            self.occupied[us] ^= rb;
+            self.all_occupied ^= rb;
+        }
+
+        // Права на рокировку
+        self.castling_rights &= castle_mask(mv.from) & castle_mask(mv.to);
+
+        // Клетка en passant
+        self.en_passant_square = if mv.piece == Piece::Pawn
+            && (mv.to as i16 - mv.from as i16).abs() == 16
+        {
+            Some((mv.from + mv.to) / 2)
+        } else {
+            None
+        };
+
+        // Счётчики
         if mv.piece == Piece::Pawn {
             self.halfmove_clock = 0;
         } else if mv.captured.is_none() {
@@ -199,10 +242,70 @@ impl Board {
         }
     }
 
-    pub fn is_square_attacked(&self, _square: u8, by_color: Color) -> bool {
-        // Simplified attack detection (will be improved in movegen)
-        let attackers = self.occupied[by_color as usize];
-        attackers != 0
+    fn pawn_attacks_bb(sq: usize, color: Color) -> Bitboard {
+        let bb = 1u64 << sq;
+        if color == Color::White {
+            ((bb << 7) & !FILE_H) | ((bb << 9) & !FILE_A)
+        } else {
+            ((bb >> 7) & !FILE_A) | ((bb >> 9) & !FILE_H)
+        }
+    }
+
+    fn knight_attacks_bb(sq: usize) -> Bitboard {
+        let (r, f) = ((sq / 8) as i32, (sq % 8) as i32);
+        let mut a = 0u64;
+        for (dr, df) in [(-2, -1), (-2, 1), (-1, -2), (-1, 2), (1, -2), (1, 2), (2, -1), (2, 1)] {
+            let (nr, nf) = (r + dr, f + df);
+            if (0..8).contains(&nr) && (0..8).contains(&nf) {
+                a |= 1u64 << (nr * 8 + nf);
+            }
+        }
+        a
+    }
+
+    fn king_attacks_bb(sq: usize) -> Bitboard {
+        let (r, f) = ((sq / 8) as i32, (sq % 8) as i32);
+        let mut a = 0u64;
+        for dr in -1..=1 {
+            for df in -1..=1 {
+                if dr == 0 && df == 0 {
+                    continue;
+                }
+                let (nr, nf) = (r + dr, f + df);
+                if (0..8).contains(&nr) && (0..8).contains(&nf) {
+                    a |= 1u64 << (nr * 8 + nf);
+                }
+            }
+        }
+        a
+    }
+
+    pub fn is_square_attacked(&self, square: u8, by_color: Color) -> bool {
+        let magic = crate::magic::MagicBitboards::get();
+        let b = by_color as usize;
+        let sq = square as usize;
+        let occ = self.all_occupied;
+
+        if Self::pawn_attacks_bb(sq, by_color.opposite()) & self.pieces[b][Piece::Pawn as usize] != 0 {
+            return true;
+        }
+        if Self::knight_attacks_bb(sq) & self.pieces[b][Piece::Knight as usize] != 0 {
+            return true;
+        }
+        if Self::king_attacks_bb(sq) & self.pieces[b][Piece::King as usize] != 0 {
+            return true;
+        }
+
+        let diag = self.pieces[b][Piece::Bishop as usize] | self.pieces[b][Piece::Queen as usize];
+        if magic.get_bishop_attacks(sq, occ) & diag != 0 {
+            return true;
+        }
+        let orth = self.pieces[b][Piece::Rook as usize] | self.pieces[b][Piece::Queen as usize];
+        if magic.get_rook_attacks(sq, occ) & orth != 0 {
+            return true;
+        }
+
+        false
     }
 
     pub fn in_check(&self) -> bool {

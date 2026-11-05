@@ -162,46 +162,53 @@ impl UciEngine {
     }
 
     fn go(&mut self, args: &[&str]) {
-        let mut depth = 8; // Default depth 8
+        let mut depth: u8 = 64;
         let mut time_limit = None;
+        let (mut wtime, mut btime, mut winc, mut binc) = (None, None, 0u64, 0u64);
+        let mut has_depth = false;
 
         let mut i = 0;
         while i < args.len() {
+            let val = args.get(i + 1).and_then(|s| s.parse::<u64>().ok());
             match args[i] {
                 "depth" => {
-                    if i + 1 < args.len() {
-                        depth = args[i + 1].parse().unwrap_or(8);
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "movetime" => {
-                    if i + 1 < args.len() {
-                        if let Ok(ms) = args[i + 1].parse::<u64>() {
-                            time_limit = Some(Duration::from_millis(ms));
-                        }
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                "wtime" | "btime" | "winc" | "binc" => {
-                    // TODO: Implement proper time management
+                    depth = val.unwrap_or(8).min(63) as u8;
+                    has_depth = true;
                     i += 2;
                 }
-                "infinite" => {
-                    depth = 64;
-                    i += 1;
+                "movetime" => {
+                    if let Some(ms) = val {
+                        time_limit = Some(Duration::from_millis(ms));
+                    }
+                    i += 2;
                 }
+                "wtime" => { wtime = val; i += 2; }
+                "btime" => { btime = val; i += 2; }
+                "winc" => { winc = val.unwrap_or(0); i += 2; }
+                "binc" => { binc = val.unwrap_or(0); i += 2; }
+                "infinite" => { depth = 63; i += 1; }
                 _ => i += 1,
             }
         }
 
-        if let Some(best_move) = self.search.find_best_move(&self.board, depth, time_limit) {
+        // Управление временем
+        if time_limit.is_none() {
+            let (t, inc) = if self.board.side_to_move == crate::board::Color::White {
+                (wtime, winc)
+            } else {
+                (btime, binc)
+            };
+            if let Some(t) = t {
+                let alloc = (t / 30 + inc / 2).min(t.saturating_sub(100)).max(10);
+                time_limit = Some(Duration::from_millis(alloc));
+            } else if !has_depth {
+                depth = 8;
+            }
+        }
+
+        if let Some(best_move) = self.search.find_best_move(&self.board, depth.min(63), time_limit) {
             println!("bestmove {}", self.format_move(&best_move));
         } else {
-            // No legal moves available, return null move
             println!("bestmove 0000");
         }
     }

@@ -151,17 +151,31 @@ impl Search {
             }
         }
 
+        // Запасной вариант: никогда не отдаём пустой ход, если легальные ходы есть
+        if best_move.is_none() {
+            return self.movegen.generate_moves(board).into_iter().next();
+        }
+
         best_move
     }
 
     fn search(&mut self, board: &Board, depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
         info.nodes += 1;
 
+        // Длина PV для этого узла инициализируется сразу, чтобы родитель
+        // никогда не читал устаревшее значение (в т.ч. при раннем выходе)
+        self.pv_length[ply as usize] = ply as usize;
+
+        // Защита от выхода за границы массивов (check extension может не уменьшать глубину)
+        if ply >= MAX_DEPTH - 1 {
+            return Evaluator::evaluate(board);
+        }
+
         if info.should_stop() {
             return 0;
         }
 
-        // Check for draw by repetition or 50-move rule
+        // Check for draw by 50-move rule
         if board.halfmove_clock >= 100 {
             return 0;
         }
@@ -198,6 +212,7 @@ impl Search {
         {
             let mut null_board = *board;
             null_board.side_to_move = null_board.side_to_move.opposite();
+            null_board.en_passant_square = None;
 
             let null_score = -self.search(
                 &null_board,
@@ -249,8 +264,6 @@ impl Search {
         let mut best_move = None;
         let original_alpha = alpha;
         let mut _moves_searched = 0;
-
-        self.pv_length[ply as usize] = ply as usize;
 
         for (move_num, mv) in ordered_moves.iter().enumerate() {
             let mut new_board = *board;
@@ -353,7 +366,8 @@ impl Search {
                 // Beta cutoff
                 if mv.captured.is_none() {
                     self.store_killer_move(*mv, ply);
-                    self.history_table[mv.from as usize][mv.to as usize] += (depth * depth) as i32;
+                    // i32 вместо u8: (depth * depth) в u8 переполняется при depth >= 16
+                    self.history_table[mv.from as usize][mv.to as usize] += (depth as i32) * (depth as i32);
                 }
 
                 self.tt.store(hash, depth, beta, NodeType::LowerBound, Some(*mv));

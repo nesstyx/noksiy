@@ -115,10 +115,11 @@ impl Evaluator {
                     score += sign * PIECE_VALUES[piece_type];
 
                     // Positional evaluation
+                    // Таблицы записаны визуально (8-я горизонталь сверху), индекс 0 = a1
                     let sq = if color == Color::White {
-                        square
+                        square ^ 56
                     } else {
-                        square ^ 56 // Mirror for black
+                        square
                     };
 
                     let positional_bonus = match piece_type {

@@ -98,31 +98,6 @@ src/
 - Rooks on open/semi-open files
 - Game phase interpolation (middlegame vs endgame)
 
-## Roadmap
-
-- [x] Bitboard representation
-- [x] Alpha-Beta pruning
-- [x] Quiescence search with delta pruning
-- [x] Transposition Table with Zobrist hashing
-- [x] Null Move Pruning
-- [x] Late Move Reductions (LMR)
-- [x] Aspiration windows
-- [x] Principal Variation tracking
-- [x] Advanced evaluation (mobility, center control, pawn structure)
-- [x] Magic Bitboards for sliders (ultra-fast move generation)
-- [ ] Futility pruning
-- [ ] Razoring
-- [ ] Internal Iterative Deepening
-- [ ] Syzygy Tablebase support
-- [ ] Opening Book
-- [ ] Multi-threading (Lazy SMP)
-- [ ] Tunable evaluation parameters
-- [ ] NNUE evaluation
-- [ ] Opening Book
-- [ ] Multi-threading (Lazy SMP)
-- [ ] Tunable evaluation parameters
-- [ ] NNUE evaluation
-
 ## Development
 
 ### Build in Debug Mode
