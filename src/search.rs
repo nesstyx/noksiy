@@ -202,12 +202,17 @@ impl Search {
             }
         }
 
-        // Запасной вариант: никогда не отдаём пустой ход, если легальные ходы есть
-        if best_move.is_none() {
-            return self.movegen.generate_moves(board).into_iter().next();
+        // Страховка: отдаём только легальный ход. Если найденного хода нет среди
+        // легальных (или его нет вовсе) — берём первый легальный.
+        let legal = self.movegen.generate_moves(board);
+        if let Some(bm) = best_move {
+            let key = self.format_move(&bm);
+            if let Some(found) = legal.iter().find(|m| self.format_move(m) == key) {
+                return Some(*found);
+            }
         }
 
-        best_move
+        legal.into_iter().next()
     }
 
     #[inline]
@@ -499,6 +504,11 @@ impl Search {
                         }
                     }
                 }
+
+                // Ход отсечения обязательно записываем в PV: в корне (мат в 1 упирается
+                // в границу beta) иначе в pv_table[0][0] остаётся ход из прошлого поиска
+                self.pv_table[ply as usize][ply as usize] = Some(*mv);
+                self.pv_length[ply as usize] = ply as usize + 1;
 
                 self.tt.store(hash, depth, Self::score_to_tt(beta, ply), NodeType::LowerBound, Some(*mv));
                 return beta;
