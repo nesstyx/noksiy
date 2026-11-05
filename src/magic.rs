@@ -1,128 +1,124 @@
-// Magic Bitboards for ultra-fast sliding piece move generation
-// Uses precomputed magic numbers to index into attack tables
+// Magic Bitboards for fast sliding piece move generation.
+//
+// Магические числа теперь ищутся при первом обращении (детерминированный ГПСЧ),
+// и каждая найденная магия проверяется на коллизии. Раньше числа были
+// захардкожены, часть из них была невалидной: разные занятости попадали в
+// один индекс и таблица молча перезаписывалась, из-за чего ладья/слон
+// "видели" сквозь фигуры (например, ладья h8 через пешку h5 до h2).
 
 use crate::board::Bitboard;
 use std::sync::OnceLock;
 
-// Magic numbers for rooks (generated offline)
-const ROOK_MAGICS: [u64; 64] = [
-    0x0080001020400080, 0x0040001000200040, 0x0080081000200080, 0x0080040800100080,
-    0x0080020400080080, 0x0080010200040080, 0x0080008001000200, 0x0080002040800100,
-    0x0000800020400080, 0x0000400020005000, 0x0000801000200080, 0x0000800800100080,
-    0x0000800400080080, 0x0000800200040080, 0x0000800100020080, 0x0000800040800100,
-    0x0000208000400080, 0x0000404000201000, 0x0000808010000800, 0x0000808008000400,
-    0x0000808004000200, 0x0000808002000100, 0x0000808001000100, 0x0000408000800100,
-    0x0000204000808000, 0x0000200040008080, 0x0000100080008080, 0x0000080080008080,
-    0x0000040080008080, 0x0000020080008080, 0x0000010080008080, 0x0000008080008080,
-    0x0000802000800040, 0x0000800800400020, 0x0000800400200010, 0x0000800200100010,
-    0x0000800100080080, 0x0000800080040080, 0x0000800040020080, 0x0000800020010080,
-    0x0000802000400040, 0x0000800800200020, 0x0000800400100010, 0x0000800200080080,
-    0x0000800100040080, 0x0000800080020080, 0x0000800040010080, 0x0000800020008080,
-    0x0000802000200040, 0x0000800800100020, 0x0000800400080010, 0x0000800200040080,
-    0x0000800100020080, 0x0000800080010080, 0x0000800040008080, 0x0000800020004080,
-    0x0000400080002080, 0x0000200040001080, 0x0000100020000880, 0x0000080010000440,
-    0x0000040008000220, 0x0000020004000110, 0x0000010002000088, 0x0000008001000044,
-];
+/// Простой xorshift64, фиксированный seed => одни и те же магии при каждом запуске.
+struct Rng(u64);
 
-// Magic numbers for bishops (generated offline)
-const BISHOP_MAGICS: [u64; 64] = [
-    0x0002020202020200, 0x0002020202020000, 0x0004010202000000, 0x0004040080000000,
-    0x0001104000000000, 0x0000821040000000, 0x0000410410400000, 0x0000104104104000,
-    0x0000040404040400, 0x0000020202020200, 0x0000040102020000, 0x0000040400800000,
-    0x0000011040000000, 0x0000008210400000, 0x0000004104104000, 0x0000002082082000,
-    0x0004000808080800, 0x0002000404040400, 0x0001000202020200, 0x0000800802004000,
-    0x0000800400A00000, 0x0000200100884000, 0x0000400082082000, 0x0000200041041000,
-    0x0002080010101000, 0x0001040008080800, 0x0000208004010400, 0x0000404004010200,
-    0x0000840000802000, 0x0000404002011000, 0x0000808001041000, 0x0000404000820800,
-    0x0001041000202000, 0x0000820800101000, 0x0000104400080800, 0x0000020080080080,
-    0x0000404040040100, 0x0000808100020100, 0x0001010100020800, 0x0000808080010400,
-    0x0000820820004000, 0x0000410410002000, 0x0000082088001000, 0x0000002011000800,
-    0x0000080100400400, 0x0001010101000200, 0x0002020202000400, 0x0001010101000200,
-    0x0000410410400000, 0x0000208208200000, 0x0000002084100000, 0x0000000020880000,
-    0x0000001002020000, 0x0000040408020000, 0x0004040404040000, 0x0002020202020000,
-    0x0000104104104000, 0x0000002082082000, 0x0000000020841000, 0x0000000000208800,
-    0x0000000010020200, 0x0000000404080200, 0x0000040404040400, 0x0002020202020200,
-];
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
 
-// Relevant occupancy bits for each square
-const ROOK_BITS: [u8; 64] = [
-    12, 11, 11, 11, 11, 11, 11, 12,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    11, 10, 10, 10, 10, 10, 10, 11,
-    12, 11, 11, 11, 11, 11, 11, 12,
-];
+    /// Число с малым количеством единичных бит — хорошие кандидаты в магии.
+    fn sparse(&mut self) -> u64 {
+        self.next() & self.next() & self.next()
+    }
+}
 
-const BISHOP_BITS: [u8; 64] = [
-    6, 5, 5, 5, 5, 5, 5, 6,
-    5, 5, 5, 5, 5, 5, 5, 5,
-    5, 5, 7, 7, 7, 7, 5, 5,
-    5, 5, 7, 9, 9, 7, 5, 5,
-    5, 5, 7, 9, 9, 7, 5, 5,
-    5, 5, 7, 7, 7, 7, 5, 5,
-    5, 5, 5, 5, 5, 5, 5, 5,
-    6, 5, 5, 5, 5, 5, 5, 6,
-];
+#[derive(Clone, Default)]
+struct Magic {
+    mask: Bitboard,
+    magic: u64,
+    shift: u32,
+    attacks: Vec<Bitboard>,
+}
+
+impl Magic {
+    #[inline(always)]
+    fn lookup(&self, occupancy: Bitboard) -> Bitboard {
+        let idx = ((occupancy & self.mask).wrapping_mul(self.magic) >> self.shift) as usize;
+        self.attacks[idx]
+    }
+}
 
 pub struct MagicBitboards {
-    rook_attacks: Vec<Vec<Bitboard>>,
-    bishop_attacks: Vec<Vec<Bitboard>>,
-    rook_masks: [Bitboard; 64],
-    bishop_masks: [Bitboard; 64],
+    rook: Vec<Magic>,
+    bishop: Vec<Magic>,
 }
 
 static MAGIC_BITBOARDS: OnceLock<MagicBitboards> = OnceLock::new();
 
 impl MagicBitboards {
     fn new() -> Self {
-        let mut magic = MagicBitboards {
-            rook_attacks: vec![vec![]; 64],
-            bishop_attacks: vec![vec![]; 64],
-            rook_masks: [0; 64],
-            bishop_masks: [0; 64],
-        };
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut rook = Vec::with_capacity(64);
+        let mut bishop = Vec::with_capacity(64);
 
-        magic.init_masks();
-        magic.init_attack_tables();
-        magic
+        for square in 0..64 {
+            rook.push(Self::build_magic(square, true, &mut rng));
+            bishop.push(Self::build_magic(square, false, &mut rng));
+        }
+
+        MagicBitboards { rook, bishop }
     }
 
     pub fn get() -> &'static MagicBitboards {
         MAGIC_BITBOARDS.get_or_init(MagicBitboards::new)
     }
 
-    fn init_masks(&mut self) {
-        for square in 0..64 {
-            self.rook_masks[square] = Self::mask_rook_attacks(square);
-            self.bishop_masks[square] = Self::mask_bishop_attacks(square);
+    /// Подбирает магию для клетки и строит таблицу атак. Коллизии с РАЗНЫМИ
+    /// результатами отвергаются, поэтому таблица всегда корректна.
+    fn build_magic(square: usize, is_rook: bool, rng: &mut Rng) -> Magic {
+        let mask = if is_rook {
+            Self::mask_rook_attacks(square)
+        } else {
+            Self::mask_bishop_attacks(square)
+        };
+        let bits = mask.count_ones();
+        let size = 1usize << bits;
+        let shift = 64 - bits;
+
+        let mut occupancies = Vec::with_capacity(size);
+        let mut reference = Vec::with_capacity(size);
+        for i in 0..size {
+            let occ = Self::index_to_occupancy(i, mask);
+            occupancies.push(occ);
+            reference.push(if is_rook {
+                Self::rook_attacks_on_the_fly(square, occ)
+            } else {
+                Self::bishop_attacks_on_the_fly(square, occ)
+            });
         }
-    }
 
-    fn init_attack_tables(&mut self) {
-        for square in 0..64 {
-            // Initialize rook attacks
-            let bits = ROOK_BITS[square];
-            let permutations = 1 << bits;
-            self.rook_attacks[square] = vec![0; permutations];
+        // 0 используем как "ячейка пуста": у ладьи/слона атаки никогда не пустые.
+        let mut table = vec![0u64; size];
 
-            for i in 0..permutations {
-                let occupancy = Self::index_to_occupancy(i, bits, self.rook_masks[square]);
-                let magic_index = Self::magic_hash(occupancy, ROOK_MAGICS[square], bits);
-                self.rook_attacks[square][magic_index] = Self::rook_attacks_on_the_fly(square, occupancy);
+        loop {
+            let magic = rng.sparse();
+            if (mask.wrapping_mul(magic) & 0xFF00_0000_0000_0000).count_ones() < 6 {
+                continue;
             }
 
-            // Initialize bishop attacks
-            let bits = BISHOP_BITS[square];
-            let permutations = 1 << bits;
-            self.bishop_attacks[square] = vec![0; permutations];
+            for e in table.iter_mut() {
+                *e = 0;
+            }
 
-            for i in 0..permutations {
-                let occupancy = Self::index_to_occupancy(i, bits, self.bishop_masks[square]);
-                let magic_index = Self::magic_hash(occupancy, BISHOP_MAGICS[square], bits);
-                self.bishop_attacks[square][magic_index] = Self::bishop_attacks_on_the_fly(square, occupancy);
+            let mut ok = true;
+            for i in 0..size {
+                let idx = (occupancies[i].wrapping_mul(magic) >> shift) as usize;
+                if table[idx] == 0 {
+                    table[idx] = reference[i];
+                } else if table[idx] != reference[i] {
+                    ok = false;
+                    break;
+                }
+            }
+
+            if ok {
+                return Magic { mask, magic, shift, attacks: table };
             }
         }
     }
@@ -137,7 +133,7 @@ impl MagicBitboards {
             attacks |= 1u64 << (r * 8 + file);
         }
         // Down
-        for r in (1..rank).rev() {
+        for r in 1..rank {
             attacks |= 1u64 << (r * 8 + file);
         }
         // Right
@@ -145,7 +141,7 @@ impl MagicBitboards {
             attacks |= 1u64 << (rank * 8 + f);
         }
         // Left
-        for f in (1..file).rev() {
+        for f in 1..file {
             attacks |= 1u64 << (rank * 8 + f);
         }
 
@@ -157,10 +153,7 @@ impl MagicBitboards {
         let rank = (square / 8) as i32;
         let file = (square % 8) as i32;
 
-        // Diagonal directions
-        let directions = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-
-        for (dr, df) in directions {
+        for (dr, df) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
             let mut r = rank + dr;
             let mut f = file + df;
 
@@ -179,32 +172,17 @@ impl MagicBitboards {
         let rank = (square / 8) as i32;
         let file = (square % 8) as i32;
 
-        // Up
-        for r in (rank + 1)..8 {
-            attacks |= 1u64 << (r * 8 + file);
-            if (occupancy & (1u64 << (r * 8 + file))) != 0 {
-                break;
-            }
-        }
-        // Down
-        for r in (0..rank).rev() {
-            attacks |= 1u64 << (r * 8 + file);
-            if (occupancy & (1u64 << (r * 8 + file))) != 0 {
-                break;
-            }
-        }
-        // Right
-        for f in (file + 1)..8 {
-            attacks |= 1u64 << (rank * 8 + f);
-            if (occupancy & (1u64 << (rank * 8 + f))) != 0 {
-                break;
-            }
-        }
-        // Left
-        for f in (0..file).rev() {
-            attacks |= 1u64 << (rank * 8 + f);
-            if (occupancy & (1u64 << (rank * 8 + f))) != 0 {
-                break;
+        for (dr, df) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let mut r = rank + dr;
+            let mut f = file + df;
+            while (0..8).contains(&r) && (0..8).contains(&f) {
+                let bit = 1u64 << (r * 8 + f);
+                attacks |= bit;
+                if occupancy & bit != 0 {
+                    break;
+                }
+                r += dr;
+                f += df;
             }
         }
 
@@ -216,16 +194,13 @@ impl MagicBitboards {
         let rank = (square / 8) as i32;
         let file = (square % 8) as i32;
 
-        let directions = [(1, 1), (1, -1), (-1, 1), (-1, -1)];
-
-        for (dr, df) in directions {
+        for (dr, df) in [(1, 1), (1, -1), (-1, 1), (-1, -1)] {
             let mut r = rank + dr;
             let mut f = file + df;
-
             while (0..8).contains(&r) && (0..8).contains(&f) {
-                let sq = (r * 8 + f) as usize;
-                attacks |= 1u64 << sq;
-                if (occupancy & (1u64 << sq)) != 0 {
+                let bit = 1u64 << (r * 8 + f);
+                attacks |= bit;
+                if occupancy & bit != 0 {
                     break;
                 }
                 r += dr;
@@ -236,41 +211,35 @@ impl MagicBitboards {
         attacks
     }
 
-    fn index_to_occupancy(index: usize, bits: u8, mask: Bitboard) -> Bitboard {
+    /// i-я подмаска: бит k индекса включает k-й установленный бит маски.
+    fn index_to_occupancy(index: usize, mask: Bitboard) -> Bitboard {
         let mut occupancy = 0u64;
-        let mut mask_copy = mask;
+        let mut m = mask;
+        let mut k = 0;
 
-        for i in 0..bits {
-            if mask_copy == 0 {
-                break;
-            }
-            let square = mask_copy.trailing_zeros();
-            mask_copy &= mask_copy - 1;
-
-            if (index & (1 << i)) != 0 {
+        while m != 0 {
+            let square = m.trailing_zeros();
+            m &= m - 1;
+            if index & (1 << k) != 0 {
                 occupancy |= 1u64 << square;
             }
+            k += 1;
         }
 
         occupancy
     }
 
-    fn magic_hash(occupancy: Bitboard, magic: u64, bits: u8) -> usize {
-        ((occupancy.wrapping_mul(magic)) >> (64 - bits)) as usize
-    }
-
+    #[inline(always)]
     pub fn get_rook_attacks(&self, square: usize, occupancy: Bitboard) -> Bitboard {
-        let occ = occupancy & self.rook_masks[square];
-        let index = Self::magic_hash(occ, ROOK_MAGICS[square], ROOK_BITS[square]);
-        self.rook_attacks[square][index]
+        self.rook[square].lookup(occupancy)
     }
 
+    #[inline(always)]
     pub fn get_bishop_attacks(&self, square: usize, occupancy: Bitboard) -> Bitboard {
-        let occ = occupancy & self.bishop_masks[square];
-        let index = Self::magic_hash(occ, BISHOP_MAGICS[square], BISHOP_BITS[square]);
-        self.bishop_attacks[square][index]
+        self.bishop[square].lookup(occupancy)
     }
 
+    #[inline(always)]
     pub fn get_queen_attacks(&self, square: usize, occupancy: Bitboard) -> Bitboard {
         self.get_rook_attacks(square, occupancy) | self.get_bishop_attacks(square, occupancy)
     }
@@ -283,33 +252,48 @@ mod tests {
     #[test]
     fn test_magic_bitboards_initialization() {
         let magic = MagicBitboards::get();
-
-        // Check that tables are initialized
-        assert_eq!(magic.rook_attacks.len(), 64);
-        assert_eq!(magic.bishop_attacks.len(), 64);
+        assert_eq!(magic.rook.len(), 64);
+        assert_eq!(magic.bishop.len(), 64);
     }
 
     #[test]
-    fn test_rook_attacks() {
+    fn test_rook_attacks_empty_board() {
         let magic = MagicBitboards::get();
-
-        // Test rook on e4 (square 28) with empty board
-        let attacks = magic.get_rook_attacks(28, 0);
-        assert_ne!(attacks, 0);
-
-        // Rook should attack entire rank and file
-        let rank_mask = 0x00000000FF000000u64; // 4th rank
-        let file_mask = 0x1010101010101010u64; // e-file
-        assert!((attacks & rank_mask) != 0);
-        assert!((attacks & file_mask) != 0);
+        let attacks = magic.get_rook_attacks(28, 0); // e4
+        assert_eq!(attacks.count_ones(), 14);
     }
 
     #[test]
-    fn test_bishop_attacks() {
+    fn test_rook_h8_blocked_by_h5() {
         let magic = MagicBitboards::get();
+        let h8 = 63;
+        let occ = 1u64 << 39; // пешка на h5
+        let attacks = magic.get_rook_attacks(h8, occ);
+        assert_ne!(attacks & (1u64 << 39), 0); // h5 бьётся (как блокер)
+        assert_eq!(attacks & (1u64 << 31), 0); // h4 — нет
+        assert_eq!(attacks & (1u64 << 15), 0); // h2 — нет
+    }
 
-        // Test bishop on e4 (square 28) with empty board
-        let attacks = magic.get_bishop_attacks(28, 0);
-        assert_ne!(attacks, 0);
+    #[test]
+    fn test_tables_match_ray_walk() {
+        let magic = MagicBitboards::get();
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        for sq in 0..64 {
+            for _ in 0..2000 {
+                let occ = rng.next() & rng.next();
+                assert_eq!(
+                    magic.get_rook_attacks(sq, occ),
+                    MagicBitboards::rook_attacks_on_the_fly(sq, occ),
+                    "rook sq={}",
+                    sq
+                );
+                assert_eq!(
+                    magic.get_bishop_attacks(sq, occ),
+                    MagicBitboards::bishop_attacks_on_the_fly(sq, occ),
+                    "bishop sq={}",
+                    sq
+                );
+            }
+        }
     }
 }
