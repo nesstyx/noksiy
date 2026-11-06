@@ -1,6 +1,7 @@
 use crate::board::{Board, Move, Piece};
 use crate::movegen::MoveGenerator;
 use crate::evaluation::Evaluator;
+use crate::magic::MagicBitboards;
 use crate::zobrist::Zobrist;
 use crate::transposition::{TranspositionTable, NodeType};
 use crate::see::SEE;
@@ -31,6 +32,9 @@ const RFP_MAX_DEPTH: u8 = 5;
 
 // Верхняя граница для таблицы истории (чтобы она не перебивала взятия и киллеры)
 const HISTORY_LIMIT: i32 = 400_000;
+
+// Late Move Pruning: сколько тихих ходов ищем полностью на глубинах 1..=3
+const LMP_LIMIT: [usize; 4] = [0, 6, 10, 15];
 
 pub struct SearchInfo {
     pub nodes: u64,
@@ -87,7 +91,8 @@ pub struct Search {
     history_table: [[i32; 64]; 64], // [from][to]
     pv_table: [[Option<Move>; MAX_DEPTH as usize]; MAX_DEPTH as usize], // Principal Variation
     pv_length: [usize; MAX_DEPTH as usize],
-    path: [u64; MAX_DEPTH as usize], // хэши позиций на текущей ветке (для повторений)
+    path: [u64; MAX_DEPTH as usize],   // хэши позиций на текущей ветке (для повторений)
+    game_history: Vec<u64>,            // хэши позиций партии (повторения с учётом истории)
     root_depth: u8,
 }
 
@@ -101,18 +106,32 @@ impl Search {
             pv_table: [[None; MAX_DEPTH as usize]; MAX_DEPTH as usize],
             pv_length: [0; MAX_DEPTH as usize],
             path: [0; MAX_DEPTH as usize],
+            game_history: Vec::new(),
             root_depth: 0,
         }
     }
 
-    pub fn find_best_move(&mut self, board: &Board, depth: u8, time_limit: Option<Duration>) -> Option<Move> {
+    /// Пересоздание TT по запросу `setoption name Hash value N` (в МБ)
+    pub fn set_hash_size(&mut self, size_mb: usize) {
+        self.tt = TranspositionTable::new(size_mb);
+    }
+
+    pub fn find_best_move(
+        &mut self,
+        board: &Board,
+        depth: u8,
+        time_limit: Option<Duration>,
+        game_history: &[u64],
+    ) -> Option<Move> {
         let mut info = SearchInfo::new();
         info.time_limit = time_limit;
 
         let depth = depth.min(MAX_DEPTH - 4);
+        self.game_history = game_history.to_vec();
 
         let mut best_move = None;
         let mut best_score;
+        let mut prev_score = 0;
 
         self.tt.new_search();
 
@@ -125,8 +144,6 @@ impl Search {
         }
 
         // Iterative deepening with aspiration windows
-        let mut prev_score = 0;
-
         for current_depth in 1..=depth {
             if info.should_stop() {
                 break;
@@ -144,12 +161,14 @@ impl Search {
 
             self.root_depth = current_depth;
 
-            // Aspiration window for depths > 4
+            // Aspiration window для глубин >= 5
             let (mut alpha, mut beta) = if current_depth >= 5 {
                 (prev_score - 50, prev_score + 50)
             } else {
                 (-INFINITY, INFINITY)
             };
+            let mut delta = 100i32;
+            let mut researches = 0;
 
             loop {
                 best_score = self.search(board, current_depth, alpha, beta, 0, true, &mut info);
@@ -158,15 +177,28 @@ impl Search {
                     break;
                 }
 
-                // Check if we need to re-search with wider window
+                // Плавное расширение окна вместо прыжка к ±бесконечности:
+                // так переисследования дешевле
                 if best_score <= alpha {
-                    // Failed low - widen down
-                    alpha = -INFINITY;
-                    continue;
+                    researches += 1;
+                    if researches >= 3 || prev_score.abs() >= MATE_BOUND {
+                        alpha = -INFINITY;
+                        beta = INFINITY;
+                    } else {
+                        beta = ((alpha + beta) / 2).min(INFINITY);
+                        alpha = (alpha - delta).max(-INFINITY);
+                        delta += delta / 2;
+                    }
                 } else if best_score >= beta {
-                    // Failed high - widen up
-                    beta = INFINITY;
-                    continue;
+                    researches += 1;
+                    if researches >= 3 || prev_score.abs() >= MATE_BOUND {
+                        alpha = -INFINITY;
+                        beta = INFINITY;
+                    } else {
+                        alpha = ((alpha + beta) / 2).max(-INFINITY);
+                        beta = (beta + delta).min(INFINITY);
+                        delta += delta / 2;
+                    }
                 } else {
                     // Score is within window
                     break;
@@ -177,34 +209,50 @@ impl Search {
                 prev_score = best_score;
                 best_move = self.pv_table[0][0];
 
-                if let Some(_mv) = best_move {
-                    // UCI info output with PV line
-                    let elapsed = info.start_time.elapsed().as_millis();
-                    let nps = if elapsed > 0 {
-                        (info.nodes as u128 * 1000) / elapsed
+                // UCI info output with PV line.
+                // Печатаем ВСЕГДА (даже без хода): при матах/патах в корне
+                // pv_table пуст, но счёт нужен GUI и инструментам анализа.
+                let elapsed = info.start_time.elapsed().as_millis();
+                let nps = if elapsed > 0 {
+                    (info.nodes as u128 * 1000) / elapsed
+                } else {
+                    0
+                };
+
+                let pv_str = self.format_pv_line();
+                let pv_part = if pv_str.is_empty() {
+                    String::new()
+                } else {
+                    format!(" pv {}", pv_str)
+                };
+                let score_str = if best_score.abs() >= MATE_BOUND {
+                    let plies = (MATE_SCORE - best_score.abs()) as u32;
+                    let moves = (plies + 1) / 2;
+                    if best_score > 0 {
+                        format!("mate {}", moves)
                     } else {
-                        0
-                    };
+                        format!("mate -{}", moves)
+                    }
+                } else {
+                    format!("cp {}", best_score)
+                };
 
-                    let pv_str = self.format_pv_line();
-
-                    println!(
-                        "info depth {} score cp {} nodes {} time {} nps {} hashfull {:.0} pv {}",
-                        current_depth,
-                        best_score,
-                        info.nodes,
-                        elapsed,
-                        nps,
-                        self.tt.usage() * 10.0,
-                        pv_str
-                    );
-                }
+                println!(
+                    "info depth {} score {} nodes {} time {} nps {} hashfull {}{}",
+                    current_depth,
+                    score_str,
+                    info.nodes,
+                    elapsed,
+                    nps,
+                    (self.tt.usage() * 10.0) as u32,
+                    pv_part
+                );
             }
         }
 
         // Страховка: отдаём только легальный ход. Если найденного хода нет среди
-        // легальных (или его нет вовсе) — берём первый легальный.
-        let legal = self.movegen.generate_moves(board);
+        // легальных (или его нет вовсе) — берём лучший по упрощённой сортировке.
+        let mut legal = self.movegen.generate_moves(board);
         if let Some(bm) = best_move {
             let key = self.format_move(&bm);
             if let Some(found) = legal.iter().find(|m| self.format_move(m) == key) {
@@ -212,6 +260,19 @@ impl Search {
             }
         }
 
+        legal.sort_by_key(|m| {
+            let mut s = 0;
+            if let Some(c) = m.captured {
+                s -= 1_000_000 + Self::piece_value(c);
+            }
+            if m.promotion.is_some() {
+                s -= 900_000;
+            }
+            if m.captured.is_none() {
+                s -= self.history_table[m.from as usize][m.to as usize];
+            }
+            s
+        });
         legal.into_iter().next()
     }
 
@@ -237,7 +298,7 @@ impl Search {
         }
     }
 
-    fn search(&mut self, board: &Board, depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
+    fn search(&mut self, board: &Board, mut depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
         info.nodes += 1;
 
         // Длина PV для этого узла инициализируется сразу, чтобы родитель
@@ -253,18 +314,40 @@ impl Search {
             return 0;
         }
 
-        // Check for draw by 50-move rule
+        let is_pv_node = beta - alpha > 1;
+        let hash = board.hash; // инкрементальный хэш — без пересчёта с нуля
+        let in_check = board.in_check();
+
+        // Правило 50 ходов. Мат важнее ничьей: под шахом проверяем, есть ли мат.
         if board.halfmove_clock >= 100 {
+            if in_check {
+                let escapes = self.movegen.generate_moves(board);
+                return if escapes.is_empty() {
+                    -MATE_SCORE + ply as i32
+                } else {
+                    0
+                };
+            }
             return 0;
         }
 
-        let is_pv_node = beta - alpha > 1;
-        let hash = Zobrist::hash(board);
-        let in_check = board.in_check();
+        // Повторения позиции: внутри текущей ветки поиска и в истории партии.
+        // Проверяем только последние `halfmove_clock` полуходов — раньше
+        // необратимый ход сделал повторение невозможным.
+        if ply > 0 && board.halfmove_clock >= 4 {
+            let hmc = board.halfmove_clock as usize;
+            let lo = (ply as usize).saturating_sub(hmc);
+            if self.path[lo..ply as usize].contains(&hash) {
+                return 0;
+            }
+            let hist_start = self.game_history.len().saturating_sub(hmc);
+            if self.game_history[hist_start..].contains(&hash) {
+                return 0;
+            }
+        }
 
-        // Повторение позиции внутри текущей ветки — считаем ничьёй
-        self.path[ply as usize] = hash;
-        if ply > 0 && self.path[..ply as usize].contains(&hash) {
+        // Материальная ничья: K против K, K+лёгкая против K и т.п.
+        if Self::is_insufficient_material(board) {
             return 0;
         }
 
@@ -285,6 +368,13 @@ impl Search {
         // Quiescence search at leaf nodes
         if depth == 0 {
             return self.quiescence(board, alpha, beta, ply, info);
+        }
+
+        // Internal Iterative Reduction: в узле нет хода из TT — нет и хорошего
+        // кандидата для сортировки, урезаем глубину, чтобы не строить дерево вслепую
+        let tt_move = self.tt.get_best_move(hash);
+        if tt_move.is_none() && depth >= 4 {
+            depth -= 1;
         }
 
         // Статическая оценка считается один раз и используется всеми отсечениями
@@ -312,6 +402,8 @@ impl Search {
             let mut null_board = *board;
             null_board.side_to_move = null_board.side_to_move.opposite();
             null_board.en_passant_square = None;
+            // null-move меняет сторону и сбрасывает ep — корректируем хэш
+            null_board.hash = Zobrist::null_move_hash(board);
 
             // Адаптивная редукция: чем глубже, тем больше режем
             let r = NULL_MOVE_REDUCTION + depth / 4;
@@ -367,18 +459,61 @@ impl Search {
         }
 
         // Move ordering for better pruning
-        let ordered_moves = self.order_moves(moves, hash, ply);
+        let ordered_moves = self.order_moves(moves, tt_move, ply);
 
         let mut best_move = None;
         let original_alpha = alpha;
+        let mut quiet_count: usize = 0;
 
         for (move_num, mv) in ordered_moves.iter().enumerate() {
+            let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
+            // Даёт ли ход шах — считаем ДО make_move (дёшево), чтобы отсечения
+            // не тратили время на применение хода
+            let gives_check = Self::move_gives_check(board, mv);
+
+            // Late Move Pruning: на малых глубинах тихие ходы после лимита не ищем
+            if !is_pv_node
+                && !in_check
+                && !gives_check
+                && is_quiet
+                && depth <= 3
+                && move_num > 0
+                && quiet_count >= LMP_LIMIT[depth as usize]
+            {
+                continue;
+            }
+
+            // Futility Pruning - skip quiet moves that can't improve alpha
+            if !is_pv_node
+                && !in_check
+                && !gives_check
+                && depth <= 3
+                && is_quiet
+                && move_num > 0
+                && alpha.abs() < MATE_BOUND
+                && static_eval + FUTILITY_MARGIN[depth as usize] <= alpha
+            {
+                continue; // Skip this move
+            }
+
+            // SEE pruning for bad captures (только в непервичных узлах, чтобы не резать жертвы в PV)
+            if !is_pv_node
+                && move_num > 0
+                && depth <= 5
+                && mv.captured.is_some()
+                && !gives_check
+                && !in_check
+            {
+                if SEE::evaluate(board, mv) < 0 {
+                    continue; // Skip losing capture
+                }
+            }
+
             let mut new_board = *board;
             new_board.make_move(*mv);
-
-            let mut score;
-            let gives_check = new_board.in_check();
-            let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
+            if is_quiet {
+                quiet_count += 1;
+            }
 
             // Check extension — ограничиваем, чтобы цепочки шахов не раздували дерево
             let extension: u8 = if gives_check
@@ -390,34 +525,7 @@ impl Search {
                 0
             };
 
-            // Futility Pruning - skip quiet moves that can't improve alpha
-            if !is_pv_node
-                && !in_check
-                && !gives_check
-                && depth <= 3
-                && is_quiet
-                && move_num > 0
-                && alpha.abs() < MATE_BOUND
-            {
-                if static_eval + FUTILITY_MARGIN[depth as usize] <= alpha {
-                    continue; // Skip this move
-                }
-            }
-
-            // SEE pruning for bad captures (только в непервичных узлах, чтобы не резать жертвы в PV)
-            if !is_pv_node
-                && move_num > 0
-                && depth <= 5
-                && mv.captured.is_some()
-                && !gives_check
-                && !in_check
-            {
-                let see_value = SEE::evaluate(board, mv.from, mv.to, mv.piece);
-                if see_value < 0 {
-                    continue; // Skip losing capture
-                }
-            }
-
+            let mut score;
             if move_num == 0 {
                 // Первый ход (обычно ход из TT) — полное окно
                 score = -self.search(
@@ -603,7 +711,8 @@ impl Search {
                         continue;
                     }
                     // Заведомо проигрышные взятия в qsearch не рассматриваем
-                    if mv.promotion.is_none() && SEE::evaluate(board, mv.from, mv.to, mv.piece) < 0 {
+                    // (SEE теперь корректный: RxP/QxR и т.п. больше не «проигрыш»)
+                    if mv.promotion.is_none() && SEE::evaluate(board, &mv) < 0 {
                         continue;
                     }
                 }
@@ -630,6 +739,96 @@ impl Search {
         alpha
     }
 
+    /// Даёт ли ход шах БЕЗ применения хода. Дешёвые magic-лукапы вместо
+    /// копирования доски и make_move.
+    fn move_gives_check(board: &Board, mv: &Move) -> bool {
+        let magic = MagicBitboards::get();
+        let gen = MoveGenerator::get();
+        let us = board.side_to_move as usize;
+        let them = 1 - us;
+
+        let king_bb = board.pieces[them][Piece::King as usize];
+        if king_bb == 0 {
+            return false;
+        }
+        let ksq = king_bb.trailing_zeros() as usize;
+        let from_bb = 1u64 << mv.from;
+        let mut occ = board.all_occupied & !from_bb;
+
+        // При en passant уходит ещё и взятая пешка — с её клетки тоже может
+        // вскрыться линия на короля
+        if mv.is_en_passant {
+            let cap_sq = if us == 0 { mv.to - 8 } else { mv.to + 8 };
+            occ &= !(1u64 << cap_sq);
+        }
+
+        // Рокировка: шах может дать только ладья, вставшая на новую вертикаль
+        if mv.is_castle {
+            let (rf, rt) = match mv.to {
+                6 => (7usize, 5usize),
+                2 => (0, 3),
+                62 => (63, 61),
+                58 => (56, 59),
+                _ => (0, 0),
+            };
+            let occ2 = occ & !(1u64 << rf);
+            return magic.get_rook_attacks(rt, occ2) & king_bb != 0;
+        }
+
+        // Прямой шах: фигура (с учётом превращения) бьёт короля с поля `to`
+        let eff = mv.promotion.unwrap_or(mv.piece);
+        let direct = match eff {
+            Piece::Pawn => gen.pawn_attacks_at(us, mv.to as usize) & king_bb != 0,
+            Piece::Knight => gen.knight_attacks_at(mv.to as usize) & king_bb != 0,
+            Piece::Bishop => magic.get_bishop_attacks(mv.to as usize, occ) & king_bb != 0,
+            Piece::Rook => magic.get_rook_attacks(mv.to as usize, occ) & king_bb != 0,
+            Piece::Queen => {
+                (magic.get_bishop_attacks(mv.to as usize, occ)
+                    | magic.get_rook_attacks(mv.to as usize, occ))
+                    & king_bb
+                    != 0
+            }
+            Piece::King => false,
+        };
+        if direct {
+            return true;
+        }
+
+        // Вскрытый шах: ушедшая фигура открывала линию своей же тяжёлой/лёгкой фигуре.
+        // Саму уходящую фигуру исключаем (её бит ещё стоит на from в битбордах доски).
+        let diag = (board.pieces[us][Piece::Bishop as usize]
+            | board.pieces[us][Piece::Queen as usize])
+            & !from_bb;
+        let orth = (board.pieces[us][Piece::Rook as usize]
+            | board.pieces[us][Piece::Queen as usize])
+            & !from_bb;
+
+        (magic.get_bishop_attacks(ksq, occ) & diag != 0)
+            || (magic.get_rook_attacks(ksq, occ) & orth != 0)
+    }
+
+    /// Материальная ничья: нет пешек/ладей/ферзей и у каждой стороны максимум
+    /// одна лёгкая фигура (KvK, KNvK, KBvK, KMNvKMN).
+    fn is_insufficient_material(board: &Board) -> bool {
+        let p = Piece::Pawn as usize;
+        let r = Piece::Rook as usize;
+        let q = Piece::Queen as usize;
+        if board.pieces[0][p] != 0 || board.pieces[1][p] != 0 {
+            return false;
+        }
+        if board.pieces[0][r] != 0 || board.pieces[1][r] != 0 {
+            return false;
+        }
+        if board.pieces[0][q] != 0 || board.pieces[1][q] != 0 {
+            return false;
+        }
+        let n = Piece::Knight as usize;
+        let b = Piece::Bishop as usize;
+        let white_minors = (board.pieces[0][n] | board.pieces[0][b]).count_ones();
+        let black_minors = (board.pieces[1][n] | board.pieces[1][b]).count_ones();
+        white_minors <= 1 && black_minors <= 1
+    }
+
     #[inline]
     fn piece_value(p: Piece) -> i32 {
         match p {
@@ -642,10 +841,8 @@ impl Search {
         }
     }
 
-    fn order_moves(&self, mut moves: Vec<Move>, hash: u64, ply: u8) -> Vec<Move> {
-        // Ход из TT ищем один раз, а не для каждого хода в сортировке
-        let tt_move = self.tt.get_best_move(hash);
-
+    fn order_moves(&self, mut moves: Vec<Move>, tt_move: Option<Move>, ply: u8) -> Vec<Move> {
+        // Ход из TT передаётся снаружи: он уже прочитан для IIR, не читаем дважды
         moves.sort_by_cached_key(|mv| {
             // Приоритеты: TT > взятия (MVV-LVA) > превращения > киллеры > история
             if let Some(tt_mv) = tt_move {

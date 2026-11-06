@@ -1,4 +1,6 @@
 use crate::board::{Board, Piece, Color, Bitboard};
+use crate::magic::MagicBitboards;
+use crate::movegen::MoveGenerator;
 
 // Base piece values in centipawns (tuned for strength)
 const PIECE_VALUES: [i32; 6] = [
@@ -168,6 +170,14 @@ impl Evaluator {
         score += Self::evaluate_rooks(board, Color::White);
         score -= Self::evaluate_rooks(board, Color::Black);
 
+        // Королевская безопасность: пешечный щит (важен в дебюте/миттельшпиле)
+        score += Self::evaluate_king_safety(board, Color::White, phase);
+        score -= Self::evaluate_king_safety(board, Color::Black, phase);
+
+        // Ладья на 7-й горизонтали
+        score += Self::evaluate_rook_seventh(board, Color::White);
+        score -= Self::evaluate_rook_seventh(board, Color::Black);
+
         // Return score from side to move perspective (+ небольшой бонус за право хода)
         if board.side_to_move == Color::White {
             score + 10
@@ -249,84 +259,123 @@ impl Evaluator {
     }
 
     fn evaluate_mobility(board: &Board, color: Color) -> i32 {
+        // Мобильность на магических битбордах — на порядок быстрее поклеточных
+        // обходов, плюс добавлена мобильность ладей и ферзей
+        let magic = MagicBitboards::get();
+        let gen = MoveGenerator::get();
         let color_idx = color as usize;
-        let mut mobility = 0;
+        let own = board.occupied[color_idx];
+        let occ = board.all_occupied;
+        let mut mobility = 0i32;
 
-        // Knights mobility
-        let mut knights = board.pieces[color_idx][Piece::Knight as usize];
-        while knights != 0 {
-            let square = knights.trailing_zeros();
-            knights &= knights - 1;
-
-            // Count potential knight moves (simplified)
-            let knight_moves = Self::count_knight_moves(square as u8, board.all_occupied);
-            mobility += knight_moves;
+        let mut bb = board.pieces[color_idx][Piece::Knight as usize];
+        while bb != 0 {
+            let square = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            mobility += (gen.knight_attacks_at(square) & !own).count_ones() as i32;
         }
 
-        // Bishops mobility
-        let mut bishops = board.pieces[color_idx][Piece::Bishop as usize];
-        while bishops != 0 {
-            let square = bishops.trailing_zeros();
-            bishops &= bishops - 1;
-
-            let bishop_moves = Self::count_diagonal_moves(square as u8, board.all_occupied);
-            mobility += bishop_moves;
+        let mut bb = board.pieces[color_idx][Piece::Bishop as usize];
+        while bb != 0 {
+            let square = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            mobility += (magic.get_bishop_attacks(square, occ) & !own).count_ones() as i32;
         }
 
-        // Вычитаем «нормальную» подвижность, чтобы бонус считался от базового уровня
-        let minor_count = (board.pieces[color_idx][Piece::Knight as usize]
-            | board.pieces[color_idx][Piece::Bishop as usize]).count_ones() as i32;
-        (mobility - minor_count * 6) * 3 // Scale factor
+        let mut bb = board.pieces[color_idx][Piece::Rook as usize];
+        while bb != 0 {
+            let square = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            mobility += (magic.get_rook_attacks(square, occ) & !own).count_ones() as i32;
+        }
+
+        let mut bb = board.pieces[color_idx][Piece::Queen as usize];
+        while bb != 0 {
+            let square = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            mobility += (magic.get_queen_attacks(square, occ) & !own).count_ones() as i32;
+        }
+
+        // Нормировка на «среднюю» подвижность каждой фигуры:
+        // бонус положителен, только если фигуры активнее обычного
+        let n = board.pieces[color_idx][Piece::Knight as usize].count_ones() as i32;
+        let b = board.pieces[color_idx][Piece::Bishop as usize].count_ones() as i32;
+        let r = board.pieces[color_idx][Piece::Rook as usize].count_ones() as i32;
+        let q = board.pieces[color_idx][Piece::Queen as usize].count_ones() as i32;
+        let expected = n * 5 + b * 7 + r * 8 + q * 13;
+
+        (mobility - expected) * 2
     }
 
-    fn count_knight_moves(square: u8, occupied: Bitboard) -> i32 {
-        let offsets = [
-            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
-            (1, -2), (1, 2), (2, -1), (2, 1),
-        ];
+    /// Пешечный щит перед королём (3 вертикали). Пропавший щит наказывается —
+    /// это мягкий, но важный стимул к рокировке. Масштабируется фазой игры.
+    fn evaluate_king_safety(board: &Board, color: Color, phase: i32) -> i32 {
+        if phase < 40 {
+            return 0; // эндшпиль: щит не важен
+        }
+        let color_idx = color as usize;
+        let king_bb = board.pieces[color_idx][Piece::King as usize];
+        if king_bb == 0 {
+            return 0;
+        }
+        let ksq = king_bb.trailing_zeros() as usize;
+        let kf = (ksq % 8) as i32;
+        let kr = (ksq / 8) as i32;
+        let dir: i32 = if color == Color::White { 1 } else { -1 };
+        let pawns = board.pieces[color_idx][Piece::Pawn as usize];
 
-        let rank = (square / 8) as i32;
-        let file = (square % 8) as i32;
-        let mut count = 0;
-
-        for (dr, df) in offsets {
-            let new_rank = rank + dr;
-            let new_file = file + df;
-            if (0..8).contains(&new_rank) && (0..8).contains(&new_file) {
-                let target = (new_rank * 8 + new_file) as u8;
-                if (occupied & (1u64 << target)) == 0 {
-                    count += 1;
-                }
+        let mut shield = 0i32;
+        for df in -1..=1 {
+            let f = kf + df;
+            if !(0..8).contains(&f) {
+                continue;
             }
-        }
-
-        count
-    }
-
-    fn count_diagonal_moves(square: u8, occupied: Bitboard) -> i32 {
-        let directions = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
-        let rank = (square / 8) as i32;
-        let file = (square % 8) as i32;
-        let mut count = 0;
-
-        for (dr, df) in directions {
-            let mut r = rank + dr;
-            let mut f = file + df;
-
-            while (0..8).contains(&r) && (0..8).contains(&f) {
-                let target = (r * 8 + f) as u8;
-                count += 1;
-
-                if (occupied & (1u64 << target)) != 0 {
+            let mut covered = false;
+            for step in 1..=2 {
+                let r = kr + dir * step;
+                if !(0..8).contains(&r) {
                     break;
                 }
-
-                r += dr;
-                f += df;
+                if pawns & (1u64 << ((r * 8 + f) as usize)) != 0 {
+                    covered = true;
+                    break;
+                }
+            }
+            if covered {
+                shield += 10;
+            } else {
+                shield -= 12;
             }
         }
 
-        count
+        shield * phase / 256
+    }
+
+    /// Ладья на 7-й горизонтали (относительной): атакует пешки и запирает короля
+    fn evaluate_rook_seventh(board: &Board, color: Color) -> i32 {
+        let color_idx = color as usize;
+        let mut score = 0i32;
+        let mut rooks = board.pieces[color_idx][Piece::Rook as usize];
+        let enemy_king = board.pieces[color_idx ^ 1][Piece::King as usize];
+
+        while rooks != 0 {
+            let square = rooks.trailing_zeros() as usize;
+            rooks &= rooks - 1;
+            let rank = (square / 8) as i32;
+            let rel_rank = if color == Color::White { rank } else { 7 - rank };
+            if rel_rank == 6 {
+                score += 20;
+                if enemy_king != 0 {
+                    let ekr = (enemy_king.trailing_zeros() / 8) as i32;
+                    let enemy_rel = if color == Color::White { 7 - ekr } else { ekr };
+                    if enemy_rel >= 7 {
+                        score += 10; // отрезает короля на последней горизонтали
+                    }
+                }
+            }
+        }
+
+        score
     }
 
     fn evaluate_rooks(board: &Board, color: Color) -> i32 {

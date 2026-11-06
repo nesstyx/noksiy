@@ -40,18 +40,28 @@ impl Default for TTEntry {
 pub struct TranspositionTable {
     entries: Vec<TTEntry>,
     size: usize,
+    mask: usize, // size всегда степень двойки — индекс по AND вместо дорогого деления
     current_age: u8,
+    used: usize, // занятые слоты (для hashfull без полного прохода по таблице)
     hits: u64,
     misses: u64,
 }
 
 impl TranspositionTable {
     pub fn new(size_mb: usize) -> Self {
-        let size = (size_mb * 1024 * 1024) / BYTES_PER_ENTRY;
+        let wanted = (size_mb.max(1) * 1024 * 1024) / BYTES_PER_ENTRY;
+        // Округляем вниз до степени двойки: индексация по AND вместо деления
+        let mut size = wanted.next_power_of_two();
+        if size > wanted {
+            size >>= 1;
+        }
+        let size = size.max(1);
         Self {
             entries: vec![TTEntry::default(); size],
             size,
+            mask: size - 1,
             current_age: 0,
+            used: 0,
             hits: 0,
             misses: 0,
         }
@@ -62,7 +72,7 @@ impl TranspositionTable {
     }
 
     fn index(&self, hash: ZobristHash) -> usize {
-        (hash as usize) % self.size
+        (hash as usize) & self.mask
     }
 
     pub fn probe(&mut self, hash: ZobristHash, depth: u8, alpha: i32, beta: i32) -> Option<i32> {
@@ -76,12 +86,14 @@ impl TranspositionTable {
                 NodeType::Exact => return Some(entry.score),
                 NodeType::LowerBound => {
                     if entry.score >= beta {
-                        return Some(beta);
+                        // Возвращаем сохранённый счёт (а не beta): так сохраняется
+                        // матовая дистанция, закодированная при записи
+                        return Some(entry.score);
                     }
                 }
                 NodeType::UpperBound => {
                     if entry.score <= alpha {
-                        return Some(alpha);
+                        return Some(entry.score);
                     }
                 }
             }
@@ -107,6 +119,9 @@ impl TranspositionTable {
             || depth >= entry.depth;
 
         if should_replace {
+            if entry.hash == 0 {
+                self.used += 1;
+            }
             *entry = TTEntry {
                 hash,
                 depth,
@@ -133,6 +148,7 @@ impl TranspositionTable {
         for entry in &mut self.entries {
             *entry = TTEntry::default();
         }
+        self.used = 0;
         self.hits = 0;
         self.misses = 0;
     }
@@ -150,9 +166,9 @@ impl TranspositionTable {
         }
     }
 
+    /// Заполненность таблицы в процентах (0-100). O(1) — счётчик поддерживается при записи.
     pub fn usage(&self) -> f64 {
-        let used = self.entries.iter().filter(|e| e.hash != 0).count();
-        (used as f64) / (self.size as f64) * 100.0
+        (self.used as f64) / (self.size as f64) * 100.0
     }
 
     #[allow(dead_code)]

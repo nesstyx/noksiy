@@ -8,7 +8,7 @@
 
 ## About
 
-Noksiy is a high-performance chess engine written entirely in Rust and **completely developed by AI** (Claude by Anthropic). This project demonstrates the cutting edge of AI-assisted software development, combining modern chess programming techniques with the power of artificial intelligence.
+Noksiy is a high-performance chess engine written entirely in Rust and developed completely by AI (Claude, GLM, and others). This project showcases modern AI-driven software engineering, combining advanced chess programming techniques with automated code generation.
 
 **Our Goal:** To create the strongest chess engine ever written by AI, leveraging Rust's performance and safety guarantees.
 

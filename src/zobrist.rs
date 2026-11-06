@@ -1,7 +1,12 @@
 // Zobrist hashing for transposition table
 // Uses precomputed random numbers to create unique position hashes
+//
+// Хэш теперь поддерживается ИНКРЕМЕНТАЛЬНО в Board::make_move (поле Board::hash),
+// поэтому поиск больше не пересчитывает его с нуля в каждом узле — это заметный
+// прирост NPS. Полный пересчёт Zobrist::hash() остаётся эталоном и используется
+// в тестах (свойство: incremental == recompute после каждого хода).
 
-use crate::board::{Board, Color, Piece};
+use crate::board::{Board, Color};
 use std::sync::OnceLock;
 
 pub type ZobristHash = u64;
@@ -18,9 +23,9 @@ static ZOBRIST_KEYS: OnceLock<ZobristKeys> = OnceLock::new();
 
 impl ZobristKeys {
     fn new() -> Self {
-        // Generate pseudo-random numbers using a simple PRNG
-        // In production, these should be truly random and precomputed
-        let mut rng = SimplePRNG::new(0x1234567890ABCDEF);
+        // SplitMix64 — детерминированный и с хорошим перемешиванием бит:
+        // для Zobrist-ключей это снижает вероятность ложных коллизий.
+        let mut rng = SimplePRNG::new(0x1234_5678_90AB_CDEF);
 
         let mut keys = ZobristKeys {
             pieces: [[[0; 64]; 6]; 2],
@@ -57,6 +62,28 @@ impl ZobristKeys {
     pub fn get() -> &'static ZobristKeys {
         ZOBRIST_KEYS.get_or_init(ZobristKeys::new)
     }
+
+    // --- Доступ к ключам для инкрементального обновления хэша ---
+
+    #[inline]
+    pub fn piece_key(&self, color: usize, piece: usize, square: usize) -> ZobristHash {
+        self.pieces[color][piece][square]
+    }
+
+    #[inline]
+    pub fn castling_key(&self, rights: u8) -> ZobristHash {
+        self.castling[rights as usize]
+    }
+
+    #[inline]
+    pub fn en_passant_key(&self, file: usize) -> ZobristHash {
+        self.en_passant[file]
+    }
+
+    #[inline]
+    pub fn side_key(&self) -> ZobristHash {
+        self.side_to_move
+    }
 }
 
 // Simple pseudo-random number generator for Zobrist keys
@@ -70,11 +97,12 @@ impl SimplePRNG {
     }
 
     fn next(&mut self) -> u64 {
-        // Xorshift64 algorithm
-        self.state ^= self.state << 13;
-        self.state ^= self.state >> 7;
-        self.state ^= self.state << 17;
-        self.state
+        // SplitMix64
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 
@@ -82,6 +110,9 @@ impl SimplePRNG {
 pub struct Zobrist;
 
 impl Zobrist {
+    /// Полный пересчёт хэша позиции (эталон для тестов, используется при постановке FEN).
+    /// Клетка en passant хэшируется только если она реально установлена
+    /// (Board нормализует её: Some <=> есть пешка, которая может взять на проходе).
     pub fn hash(board: &Board) -> ZobristHash {
         let keys = ZobristKeys::get();
         let mut hash = 0u64;
@@ -115,38 +146,15 @@ impl Zobrist {
         hash
     }
 
-    // Update hash incrementally after a move (faster than recomputing)
-    pub fn update_hash(
-        hash: ZobristHash,
-        from: u8,
-        to: u8,
-        piece: Piece,
-        color: Color,
-        captured: Option<Piece>,
-    ) -> ZobristHash {
+    /// Хэш позиции после null-move (пропуск хода): меняется только сторона
+    /// и сбрасывается клетка en passant. Фигуры не трогаются.
+    pub fn null_move_hash(board: &Board) -> ZobristHash {
         let keys = ZobristKeys::get();
-        let mut new_hash = hash;
-
-        let color_idx = color as usize;
-        let piece_idx = piece as usize;
-
-        // Remove piece from source square
-        new_hash ^= keys.pieces[color_idx][piece_idx][from as usize];
-
-        // Add piece to destination square
-        new_hash ^= keys.pieces[color_idx][piece_idx][to as usize];
-
-        // Handle capture
-        if let Some(captured_piece) = captured {
-            let opp_color = color.opposite() as usize;
-            let captured_idx = captured_piece as usize;
-            new_hash ^= keys.pieces[opp_color][captured_idx][to as usize];
+        let mut hash = board.hash ^ keys.side_key();
+        if let Some(ep_square) = board.en_passant_square {
+            hash ^= keys.en_passant_key((ep_square % 8) as usize);
         }
-
-        // Toggle side to move
-        new_hash ^= keys.side_to_move;
-
-        new_hash
+        hash
     }
 }
 
@@ -172,5 +180,19 @@ mod tests {
         let hash2 = Zobrist::hash(&board);
 
         assert_eq!(hash1, hash2, "Same position should always hash to same value");
+    }
+
+    #[test]
+    fn test_null_move_hash_toggles_side() {
+        let board = Board::new();
+        let h0 = Zobrist::hash(&board);
+        let h1 = Zobrist::null_move_hash(&board);
+        assert_ne!(h0, h1);
+        // Двойной null возвращает исходный хэш
+        let mut board2 = board;
+        board2.side_to_move = board2.side_to_move.opposite();
+        board2.hash = h1;
+        let h2 = Zobrist::null_move_hash(&board2);
+        assert_eq!(h0, h2);
     }
 }

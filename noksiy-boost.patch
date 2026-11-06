@@ -1,0 +1,2998 @@
+diff --git a/Cargo.toml b/Cargo.toml
+new file mode 100644
+index 0000000..3bb6120
+--- /dev/null
++++ b/Cargo.toml
+@@ -0,0 +1,11 @@
++[package]
++name = "noksiy"
++version = "0.6.0"
++edition = "2021"
++
++[dependencies]
++
++[profile.release]
++opt-level = 3
++lto = "thin"
++codegen-units = 1
+diff --git a/src/board.rs b/src/board.rs
+index 3e6c951..83642f7 100755
+--- a/src/board.rs
++++ b/src/board.rs
+@@ -1,4 +1,10 @@
+ // Bitboard representation for maximum performance
++//
++// Ключевое изменение: у доски есть поле `hash` (Zobrist), которое поддерживается
++// ИНКРЕМЕНТАЛЬНО в make_move. Поиск больше не пересчитывает хэш с нуля в каждом
++// узле. Клетка en passant ставится только когда взятие на проходе реально
++// возможно (рядом есть пешка соперника) — это делает позиции, отличающиеся
++// лишь «мёртвой» ep-клеткой, идентичными для TT и детекции повторений.
+ pub type Bitboard = u64;
+ 
+ const FILE_A: u64 = 0x0101010101010101;
+@@ -65,6 +71,9 @@ pub struct Board {
+     pub en_passant_square: Option<u8>,
+     pub halfmove_clock: u16,
+     pub fullmove_number: u16,
++
++    /// Инкрементальный Zobrist-хэш позиции (обновляется в make_move).
++    pub hash: u64,
+ }
+ 
+ impl Board {
+@@ -82,6 +91,7 @@ impl Board {
+             en_passant_square: None,
+             halfmove_clock: 0,
+             fullmove_number: 1,
++            hash: 0,
+         };
+ 
+         let parts: Vec<&str> = fen.split_whitespace().collect();
+@@ -141,6 +151,19 @@ impl Board {
+             board.fullmove_number = parts[5].parse().unwrap_or(1);
+         }
+ 
++        // Нормализация en passant: оставляем ep-клетку только если взятие
++        // на проходе реально возможно. Иначе «мёртвая» ep-клетка порождает
++        // разные хэши у одинаковых позиций (провал TT и детекции повторений).
++        if let Some(ep) = board.en_passant_square {
++            let side = board.side_to_move;
++            let attackers = Self::pawn_attacks_bb(ep as usize, side.opposite())
++                & board.pieces[side as usize][Piece::Pawn as usize];
++            if attackers == 0 {
++                board.en_passant_square = None;
++            }
++        }
++
++        board.hash = crate::zobrist::Zobrist::hash(&board);
+         board
+     }
+ 
+@@ -173,34 +196,45 @@ impl Board {
+     }
+ 
+     pub fn make_move(&mut self, mv: Move) {
++        let keys = crate::zobrist::ZobristKeys::get();
+         let from_bb = 1u64 << mv.from;
+         let to_bb = 1u64 << mv.to;
+         let us = self.side_to_move as usize;
+         let them = self.side_to_move.opposite() as usize;
++        let mut hash = self.hash;
++
++        // Старая ep-клетка выпадает из хэша (если была)
++        if let Some(ep) = self.en_passant_square {
++            hash ^= keys.en_passant_key((ep % 8) as usize);
++        }
+ 
+         // Убираем фигуру с исходной клетки
+         self.pieces[us][mv.piece as usize] &= !from_bb;
+         self.occupied[us] &= !from_bb;
+         self.all_occupied &= !from_bb;
++        hash ^= keys.piece_key(us, mv.piece as usize, mv.from as usize);
+ 
+         // Взятие (включая en passant)
+         if let Some(captured) = mv.captured {
+-            let cap_bb = if mv.is_en_passant {
+-                if us == 0 { to_bb >> 8 } else { to_bb << 8 }
++            let cap_sq: u8 = if mv.is_en_passant {
++                if us == 0 { mv.to - 8 } else { mv.to + 8 }
+             } else {
+-                to_bb
++                mv.to
+             };
++            let cap_bb = 1u64 << cap_sq;
+             self.pieces[them][captured as usize] &= !cap_bb;
+             self.occupied[them] &= !cap_bb;
+             self.all_occupied &= !cap_bb;
++            hash ^= keys.piece_key(them, captured as usize, cap_sq as usize);
+             self.halfmove_clock = 0;
+         }
+ 
+-        // Ставим фигуру
++        // Ставим фигуру (с учётом превращения)
+         let final_piece = mv.promotion.unwrap_or(mv.piece);
+         self.pieces[us][final_piece as usize] |= to_bb;
+         self.occupied[us] |= to_bb;
+         self.all_occupied |= to_bb;
++        hash ^= keys.piece_key(us, final_piece as usize, mv.to as usize);
+ 
+         // Рокировка: двигаем ладью
+         if mv.is_castle {
+@@ -215,19 +249,35 @@ impl Board {
+             self.pieces[us][Piece::Rook as usize] ^= rb;
+             self.occupied[us] ^= rb;
+             self.all_occupied ^= rb;
++            hash ^= keys.piece_key(us, Piece::Rook as usize, rf as usize)
++                ^ keys.piece_key(us, Piece::Rook as usize, rt as usize);
+         }
+ 
+         // Права на рокировку
++        let old_rights = self.castling_rights;
+         self.castling_rights &= castle_mask(mv.from) & castle_mask(mv.to);
++        hash ^= keys.castling_key(old_rights) ^ keys.castling_key(self.castling_rights);
+ 
+-        // Клетка en passant
++        // Клетка en passant: ставим только если рядом есть пешка соперника,
++        // которая реально может взять на проходе
+         self.en_passant_square = if mv.piece == Piece::Pawn
+             && (mv.to as i16 - mv.from as i16).abs() == 16
+         {
+-            Some((mv.from + mv.to) / 2)
++            let ep = (mv.from + mv.to) / 2;
++            let ep_attackers =
++                Self::pawn_attacks_bb(ep as usize, self.side_to_move)
++                    & self.pieces[them][Piece::Pawn as usize];
++            if ep_attackers != 0 {
++                Some(ep)
++            } else {
++                None
++            }
+         } else {
+             None
+         };
++        if let Some(ep) = self.en_passant_square {
++            hash ^= keys.en_passant_key((ep % 8) as usize);
++        }
+ 
+         // Счётчики
+         if mv.piece == Piece::Pawn {
+@@ -240,6 +290,9 @@ impl Board {
+         if self.side_to_move == Color::White {
+             self.fullmove_number += 1;
+         }
++
++        hash ^= keys.side_key();
++        self.hash = hash;
+     }
+ 
+     fn pawn_attacks_bb(sq: usize, color: Color) -> Bitboard {
+@@ -323,4 +376,132 @@ impl Default for Board {
+     fn default() -> Self {
+         Self::new()
+     }
+-}
+\ No newline at end of file
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::movegen::MoveGenerator;
++    use crate::zobrist::Zobrist;
++
++    fn perft(board: &Board, gen: &MoveGenerator, depth: u8) -> u64 {
++        if depth == 0 {
++            return 1;
++        }
++        let mut nodes = 0u64;
++        for mv in gen.generate_moves(board) {
++            let mut b = *board;
++            b.make_move(mv);
++            nodes += perft(&b, gen, depth - 1);
++        }
++        nodes
++    }
++
++    #[test]
++    fn perft_startpos() {
++        let gen = MoveGenerator::get();
++        let b = Board::new();
++        assert_eq!(perft(&b, gen, 1), 20);
++        assert_eq!(perft(&b, gen, 2), 400);
++        assert_eq!(perft(&b, gen, 3), 8_902);
++        assert_eq!(perft(&b, gen, 4), 197_281);
++    }
++
++    #[test]
++    #[ignore] // медленно в debug: cargo test --release -- --ignored
++    fn perft_startpos_d5() {
++        let gen = MoveGenerator::get();
++        let b = Board::new();
++        assert_eq!(perft(&b, gen, 5), 4_865_609);
++    }
++
++    #[test]
++    fn perft_kiwipete() {
++        let gen = MoveGenerator::get();
++        let b = Board::from_fen(
++            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
++        );
++        assert_eq!(perft(&b, gen, 1), 48);
++        assert_eq!(perft(&b, gen, 2), 2_039);
++        assert_eq!(perft(&b, gen, 3), 97_862);
++    }
++
++    #[test]
++    #[ignore]
++    fn perft_kiwipete_d4() {
++        let gen = MoveGenerator::get();
++        let b = Board::from_fen(
++            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
++        );
++        assert_eq!(perft(&b, gen, 4), 4_085_603);
++    }
++
++    #[test]
++    fn perft_position3() {
++        // ep-взятия, pinned-пешки
++        let gen = MoveGenerator::get();
++        let b = Board::from_fen("8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1");
++        assert_eq!(perft(&b, gen, 1), 14);
++        assert_eq!(perft(&b, gen, 2), 191);
++        assert_eq!(perft(&b, gen, 3), 2_812);
++        assert_eq!(perft(&b, gen, 4), 43_238);
++    }
++
++    #[test]
++    fn perft_position4() {
++        // превращения и шахи
++        let gen = MoveGenerator::get();
++        let b = Board::from_fen(
++            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
++        );
++        assert_eq!(perft(&b, gen, 1), 6);
++        assert_eq!(perft(&b, gen, 2), 264);
++        assert_eq!(perft(&b, gen, 3), 9_467);
++    }
++
++    #[test]
++    fn incremental_hash_matches_recompute() {
++        // Случайные партии из разных стартовых позиций: после КАЖДОГО хода
++        // инкрементальный хэш обязан совпадать с полным пересчётом.
++        let gen = MoveGenerator::get();
++        let starts = [
++            "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
++            "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
++            "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
++            "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/Pp1P2PP/R2Q1RK1 w kq - 0 1",
++        ];
++        let mut rng = 0x1234_5678_9ABC_DEF0u64;
++        for fen in starts {
++            let mut board = Board::from_fen(fen);
++            for _ in 0..160 {
++                let moves = gen.generate_moves(&board);
++                if moves.is_empty() {
++                    break;
++                }
++                rng ^= rng << 13;
++                rng ^= rng >> 7;
++                rng ^= rng << 17;
++                let mv = moves[(rng as usize) % moves.len()];
++                board.make_move(mv);
++                assert_eq!(
++                    board.hash,
++                    Zobrist::hash(&board),
++                    "hash mismatch after {:?} in {}",
++                    mv,
++                    fen
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn en_passant_normalized() {
++        // ep-клетка без пешки соперника рядом — «мёртвая», должна сбрасываться
++        let b = Board::from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
++        assert_eq!(b.en_passant_square, None, "нет чёрных пешек d4/f4 — ep некому брать");
++
++        // а здесь взять можно: пешка e5 может взять чёрную пешку d5 на проходе
++        let b2 = Board::from_fen("rnbqkbnr/ppp1pppp/8/3pP3/8/8/PPPP1PPP/RNBQKBNR w KQkq d6 0 3");
++        assert!(b2.en_passant_square.is_some(), "пешка e5 может взять на d6");
++    }
++}
+diff --git a/src/evaluation.rs b/src/evaluation.rs
+index 2abe83c..7a11732 100755
+--- a/src/evaluation.rs
++++ b/src/evaluation.rs
+@@ -1,4 +1,6 @@
+ use crate::board::{Board, Piece, Color, Bitboard};
++use crate::magic::MagicBitboards;
++use crate::movegen::MoveGenerator;
+ 
+ // Base piece values in centipawns (tuned for strength)
+ const PIECE_VALUES: [i32; 6] = [
+@@ -168,6 +170,14 @@ impl Evaluator {
+         score += Self::evaluate_rooks(board, Color::White);
+         score -= Self::evaluate_rooks(board, Color::Black);
+ 
++        // Королевская безопасность: пешечный щит (важен в дебюте/миттельшпиле)
++        score += Self::evaluate_king_safety(board, Color::White, phase);
++        score -= Self::evaluate_king_safety(board, Color::Black, phase);
++
++        // Ладья на 7-й горизонтали
++        score += Self::evaluate_rook_seventh(board, Color::White);
++        score -= Self::evaluate_rook_seventh(board, Color::Black);
++
+         // Return score from side to move perspective (+ небольшой бонус за право хода)
+         if board.side_to_move == Color::White {
+             score + 10
+@@ -249,84 +259,123 @@ impl Evaluator {
+     }
+ 
+     fn evaluate_mobility(board: &Board, color: Color) -> i32 {
++        // Мобильность на магических битбордах — на порядок быстрее поклеточных
++        // обходов, плюс добавлена мобильность ладей и ферзей
++        let magic = MagicBitboards::get();
++        let gen = MoveGenerator::get();
+         let color_idx = color as usize;
+-        let mut mobility = 0;
+-
+-        // Knights mobility
+-        let mut knights = board.pieces[color_idx][Piece::Knight as usize];
+-        while knights != 0 {
+-            let square = knights.trailing_zeros();
+-            knights &= knights - 1;
++        let own = board.occupied[color_idx];
++        let occ = board.all_occupied;
++        let mut mobility = 0i32;
++
++        let mut bb = board.pieces[color_idx][Piece::Knight as usize];
++        while bb != 0 {
++            let square = bb.trailing_zeros() as usize;
++            bb &= bb - 1;
++            mobility += (gen.knight_attacks_at(square) & !own).count_ones() as i32;
++        }
+ 
+-            // Count potential knight moves (simplified)
+-            let knight_moves = Self::count_knight_moves(square as u8, board.all_occupied);
+-            mobility += knight_moves;
++        let mut bb = board.pieces[color_idx][Piece::Bishop as usize];
++        while bb != 0 {
++            let square = bb.trailing_zeros() as usize;
++            bb &= bb - 1;
++            mobility += (magic.get_bishop_attacks(square, occ) & !own).count_ones() as i32;
+         }
+ 
+-        // Bishops mobility
+-        let mut bishops = board.pieces[color_idx][Piece::Bishop as usize];
+-        while bishops != 0 {
+-            let square = bishops.trailing_zeros();
+-            bishops &= bishops - 1;
++        let mut bb = board.pieces[color_idx][Piece::Rook as usize];
++        while bb != 0 {
++            let square = bb.trailing_zeros() as usize;
++            bb &= bb - 1;
++            mobility += (magic.get_rook_attacks(square, occ) & !own).count_ones() as i32;
++        }
+ 
+-            let bishop_moves = Self::count_diagonal_moves(square as u8, board.all_occupied);
+-            mobility += bishop_moves;
++        let mut bb = board.pieces[color_idx][Piece::Queen as usize];
++        while bb != 0 {
++            let square = bb.trailing_zeros() as usize;
++            bb &= bb - 1;
++            mobility += (magic.get_queen_attacks(square, occ) & !own).count_ones() as i32;
+         }
+ 
+-        // Вычитаем «нормальную» подвижность, чтобы бонус считался от базового уровня
+-        let minor_count = (board.pieces[color_idx][Piece::Knight as usize]
+-            | board.pieces[color_idx][Piece::Bishop as usize]).count_ones() as i32;
+-        (mobility - minor_count * 6) * 3 // Scale factor
++        // Нормировка на «среднюю» подвижность каждой фигуры:
++        // бонус положителен, только если фигуры активнее обычного
++        let n = board.pieces[color_idx][Piece::Knight as usize].count_ones() as i32;
++        let b = board.pieces[color_idx][Piece::Bishop as usize].count_ones() as i32;
++        let r = board.pieces[color_idx][Piece::Rook as usize].count_ones() as i32;
++        let q = board.pieces[color_idx][Piece::Queen as usize].count_ones() as i32;
++        let expected = n * 5 + b * 7 + r * 8 + q * 13;
++
++        (mobility - expected) * 2
+     }
+ 
+-    fn count_knight_moves(square: u8, occupied: Bitboard) -> i32 {
+-        let offsets = [
+-            (-2, -1), (-2, 1), (-1, -2), (-1, 2),
+-            (1, -2), (1, 2), (2, -1), (2, 1),
+-        ];
+-
+-        let rank = (square / 8) as i32;
+-        let file = (square % 8) as i32;
+-        let mut count = 0;
+-
+-        for (dr, df) in offsets {
+-            let new_rank = rank + dr;
+-            let new_file = file + df;
+-            if (0..8).contains(&new_rank) && (0..8).contains(&new_file) {
+-                let target = (new_rank * 8 + new_file) as u8;
+-                if (occupied & (1u64 << target)) == 0 {
+-                    count += 1;
++    /// Пешечный щит перед королём (3 вертикали). Пропавший щит наказывается —
++    /// это мягкий, но важный стимул к рокировке. Масштабируется фазой игры.
++    fn evaluate_king_safety(board: &Board, color: Color, phase: i32) -> i32 {
++        if phase < 40 {
++            return 0; // эндшпиль: щит не важен
++        }
++        let color_idx = color as usize;
++        let king_bb = board.pieces[color_idx][Piece::King as usize];
++        if king_bb == 0 {
++            return 0;
++        }
++        let ksq = king_bb.trailing_zeros() as usize;
++        let kf = (ksq % 8) as i32;
++        let kr = (ksq / 8) as i32;
++        let dir: i32 = if color == Color::White { 1 } else { -1 };
++        let pawns = board.pieces[color_idx][Piece::Pawn as usize];
++
++        let mut shield = 0i32;
++        for df in -1..=1 {
++            let f = kf + df;
++            if !(0..8).contains(&f) {
++                continue;
++            }
++            let mut covered = false;
++            for step in 1..=2 {
++                let r = kr + dir * step;
++                if !(0..8).contains(&r) {
++                    break;
+                 }
++                if pawns & (1u64 << ((r * 8 + f) as usize)) != 0 {
++                    covered = true;
++                    break;
++                }
++            }
++            if covered {
++                shield += 10;
++            } else {
++                shield -= 12;
+             }
+         }
+ 
+-        count
++        shield * phase / 256
+     }
+ 
+-    fn count_diagonal_moves(square: u8, occupied: Bitboard) -> i32 {
+-        let directions = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+-        let rank = (square / 8) as i32;
+-        let file = (square % 8) as i32;
+-        let mut count = 0;
+-
+-        for (dr, df) in directions {
+-            let mut r = rank + dr;
+-            let mut f = file + df;
+-
+-            while (0..8).contains(&r) && (0..8).contains(&f) {
+-                let target = (r * 8 + f) as u8;
+-                count += 1;
++    /// Ладья на 7-й горизонтали (относительной): атакует пешки и запирает короля
++    fn evaluate_rook_seventh(board: &Board, color: Color) -> i32 {
++        let color_idx = color as usize;
++        let mut score = 0i32;
++        let mut rooks = board.pieces[color_idx][Piece::Rook as usize];
++        let enemy_king = board.pieces[color_idx ^ 1][Piece::King as usize];
+ 
+-                if (occupied & (1u64 << target)) != 0 {
+-                    break;
++        while rooks != 0 {
++            let square = rooks.trailing_zeros() as usize;
++            rooks &= rooks - 1;
++            let rank = (square / 8) as i32;
++            let rel_rank = if color == Color::White { rank } else { 7 - rank };
++            if rel_rank == 6 {
++                score += 20;
++                if enemy_king != 0 {
++                    let ekr = (enemy_king.trailing_zeros() / 8) as i32;
++                    let enemy_rel = if color == Color::White { 7 - ekr } else { ekr };
++                    if enemy_rel >= 7 {
++                        score += 10; // отрезает короля на последней горизонтали
++                    }
+                 }
+-
+-                r += dr;
+-                f += df;
+             }
+         }
+ 
+-        count
++        score
+     }
+ 
+     fn evaluate_rooks(board: &Board, color: Color) -> i32 {
+diff --git a/src/main.rs b/src/main.rs
+index ec871ec..b19021b 100755
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -11,7 +11,7 @@ mod see;
+ use uci::UciEngine;
+ 
+ fn main() {
+-    println!("Noksiy Chess Engine v0.5.0");
++    println!("Noksiy Chess Engine v0.6.0");
+     println!("The world's strongest AI-written chess engine in Rust");
+     println!("100% AI-generated code by Claude (Anthropic)");
+     println!("Type 'uci' to start UCI protocol");
+diff --git a/src/movegen.rs b/src/movegen.rs
+index beb7ca8..509d32e 100755
+--- a/src/movegen.rs
++++ b/src/movegen.rs
+@@ -1,5 +1,6 @@
+ use crate::board::{Board, Bitboard, Piece, Color, Move};
+ use crate::magic::MagicBitboards;
++use std::sync::OnceLock;
+ 
+ // Precalculated attack tables for fast move generation
+ pub struct MoveGenerator {
+@@ -8,7 +9,15 @@ pub struct MoveGenerator {
+     pawn_attacks: [[Bitboard; 64]; 2], // [color][square]
+ }
+ 
++static SHARED_MOVEGEN: OnceLock<MoveGenerator> = OnceLock::new();
++
+ impl MoveGenerator {
++    /// Общий статический экземпляр: таблицы атак неизменяемы, поэтому их
++    /// безопасно переиспользовать (eval, gives_check, UCI).
++    pub fn get() -> &'static MoveGenerator {
++        SHARED_MOVEGEN.get_or_init(MoveGenerator::new)
++    }
++
+     pub fn new() -> Self {
+         let mut gen = MoveGenerator {
+             knight_attacks: [0; 64],
+@@ -28,6 +37,16 @@ impl MoveGenerator {
+         }
+     }
+ 
++    #[inline]
++    pub fn knight_attacks_at(&self, square: usize) -> Bitboard {
++        self.knight_attacks[square]
++    }
++
++    #[inline]
++    pub fn pawn_attacks_at(&self, color: usize, square: usize) -> Bitboard {
++        self.pawn_attacks[color][square]
++    }
++
+     fn generate_knight_attacks(square: usize) -> Bitboard {
+         let sq = square as i32;
+         let rank = sq / 8;
+diff --git a/src/search.rs b/src/search.rs
+index ba0a626..26105c6 100755
+--- a/src/search.rs
++++ b/src/search.rs
+@@ -1,766 +1,963 @@
+-use crate::board::{Board, Move, Piece};
+-use crate::movegen::MoveGenerator;
+-use crate::evaluation::Evaluator;
+-use crate::zobrist::Zobrist;
+-use crate::transposition::{TranspositionTable, NodeType};
+-use crate::see::SEE;
+-use std::time::{Duration, Instant};
+-
+-const MAX_DEPTH: u8 = 64;
+-const INFINITY: i32 = 1_000_000;
+-const MATE_SCORE: i32 = 900_000;
+-const MATE_BOUND: i32 = MATE_SCORE - 1000; // всё, что дальше этой границы, считаем матовым счётом
+-
+-// Null Move Pruning parameters
+-const NULL_MOVE_REDUCTION: u8 = 2;
+-const NULL_MOVE_MIN_DEPTH: u8 = 3;
+-
+-// Late Move Reductions parameters
+-const LMR_MIN_DEPTH: u8 = 3;
+-const LMR_FULL_DEPTH_MOVES: usize = 4;
+-
+-// Futility Pruning margins
+-const FUTILITY_MARGIN: [i32; 4] = [0, 200, 300, 500];
+-
+-// Razoring margins
+-const RAZOR_MARGIN: [i32; 4] = [0, 300, 400, 600];
+-
+-// Reverse futility (static null move) — маржа за единицу глубины
+-const RFP_MARGIN: i32 = 100;
+-const RFP_MAX_DEPTH: u8 = 5;
+-
+-// Верхняя граница для таблицы истории (чтобы она не перебивала взятия и киллеры)
+-const HISTORY_LIMIT: i32 = 400_000;
+-
+-pub struct SearchInfo {
+-    pub nodes: u64,
+-    pub start_time: Instant,
+-    pub time_limit: Option<Duration>,
+-    pub stop: bool,
+-}
+-
+-impl SearchInfo {
+-    pub fn new() -> Self {
+-        Self {
+-            nodes: 0,
+-            start_time: Instant::now(),
+-            time_limit: None,
+-            stop: false,
+-        }
+-    }
+-
+-    /// Полная проверка (используется вне горячего пути)
+-    pub fn should_stop(&self) -> bool {
+-        if self.stop {
+-            return true;
+-        }
+-        if let Some(limit) = self.time_limit {
+-            if self.start_time.elapsed() >= limit {
+-                return true;
+-            }
+-        }
+-        false
+-    }
+-
+-    /// Дешёвая проверка для горячего пути: часы читаем раз в 2048 узлов,
+-    /// а при истечении времени взводим флаг `stop`, который уже не сбрасывается.
+-    #[inline]
+-    fn poll(&mut self) -> bool {
+-        if self.stop {
+-            return true;
+-        }
+-        if self.nodes & 2047 == 0 {
+-            if let Some(limit) = self.time_limit {
+-                if self.start_time.elapsed() >= limit {
+-                    self.stop = true;
+-                }
+-            }
+-        }
+-        self.stop
+-    }
+-}
+-
+-pub struct Search {
+-    movegen: MoveGenerator,
+-    tt: TranspositionTable,
+-    killer_moves: [[Option<Move>; 2]; MAX_DEPTH as usize],
+-    history_table: [[i32; 64]; 64], // [from][to]
+-    pv_table: [[Option<Move>; MAX_DEPTH as usize]; MAX_DEPTH as usize], // Principal Variation
+-    pv_length: [usize; MAX_DEPTH as usize],
+-    path: [u64; MAX_DEPTH as usize], // хэши позиций на текущей ветке (для повторений)
+-    root_depth: u8,
+-}
+-
+-impl Search {
+-    pub fn new() -> Self {
+-        Self {
+-            movegen: MoveGenerator::new(),
+-            tt: TranspositionTable::new_default(),
+-            killer_moves: [[None; 2]; MAX_DEPTH as usize],
+-            history_table: [[0; 64]; 64],
+-            pv_table: [[None; MAX_DEPTH as usize]; MAX_DEPTH as usize],
+-            pv_length: [0; MAX_DEPTH as usize],
+-            path: [0; MAX_DEPTH as usize],
+-            root_depth: 0,
+-        }
+-    }
+-
+-    pub fn find_best_move(&mut self, board: &Board, depth: u8, time_limit: Option<Duration>) -> Option<Move> {
+-        let mut info = SearchInfo::new();
+-        info.time_limit = time_limit;
+-
+-        let depth = depth.min(MAX_DEPTH - 4);
+-
+-        let mut best_move = None;
+-        let mut best_score;
+-
+-        self.tt.new_search();
+-
+-        // Киллеры устаревают между ходами, историю старим (делим пополам)
+-        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
+-        for row in self.history_table.iter_mut() {
+-            for h in row.iter_mut() {
+-                *h /= 2;
+-            }
+-        }
+-
+-        // Iterative deepening with aspiration windows
+-        let mut prev_score = 0;
+-
+-        for current_depth in 1..=depth {
+-            if info.should_stop() {
+-                break;
+-            }
+-
+-            // Не начинаем новую итерацию, если съедено >60% времени:
+-            // следующая итерация всё равно не успеет закончиться
+-            if current_depth > 1 && best_move.is_some() {
+-                if let Some(limit) = info.time_limit {
+-                    if info.start_time.elapsed() * 10 >= limit * 6 {
+-                        break;
+-                    }
+-                }
+-            }
+-
+-            self.root_depth = current_depth;
+-
+-            // Aspiration window for depths > 4
+-            let (mut alpha, mut beta) = if current_depth >= 5 {
+-                (prev_score - 50, prev_score + 50)
+-            } else {
+-                (-INFINITY, INFINITY)
+-            };
+-
+-            loop {
+-                best_score = self.search(board, current_depth, alpha, beta, 0, true, &mut info);
+-
+-                if info.should_stop() {
+-                    break;
+-                }
+-
+-                // Check if we need to re-search with wider window
+-                if best_score <= alpha {
+-                    // Failed low - widen down
+-                    alpha = -INFINITY;
+-                    continue;
+-                } else if best_score >= beta {
+-                    // Failed high - widen up
+-                    beta = INFINITY;
+-                    continue;
+-                } else {
+-                    // Score is within window
+-                    break;
+-                }
+-            }
+-
+-            if !info.should_stop() {
+-                prev_score = best_score;
+-                best_move = self.pv_table[0][0];
+-
+-                if let Some(_mv) = best_move {
+-                    // UCI info output with PV line
+-                    let elapsed = info.start_time.elapsed().as_millis();
+-                    let nps = if elapsed > 0 {
+-                        (info.nodes as u128 * 1000) / elapsed
+-                    } else {
+-                        0
+-                    };
+-
+-                    let pv_str = self.format_pv_line();
+-
+-                    println!(
+-                        "info depth {} score cp {} nodes {} time {} nps {} hashfull {:.0} pv {}",
+-                        current_depth,
+-                        best_score,
+-                        info.nodes,
+-                        elapsed,
+-                        nps,
+-                        self.tt.usage() * 10.0,
+-                        pv_str
+-                    );
+-                }
+-            }
+-        }
+-
+-        // Страховка: отдаём только легальный ход. Если найденного хода нет среди
+-        // легальных (или его нет вовсе) — берём первый легальный.
+-        let legal = self.movegen.generate_moves(board);
+-        if let Some(bm) = best_move {
+-            let key = self.format_move(&bm);
+-            if let Some(found) = legal.iter().find(|m| self.format_move(m) == key) {
+-                return Some(*found);
+-            }
+-        }
+-
+-        legal.into_iter().next()
+-    }
+-
+-    #[inline]
+-    fn score_to_tt(score: i32, ply: u8) -> i32 {
+-        if score >= MATE_BOUND {
+-            score + ply as i32
+-        } else if score <= -MATE_BOUND {
+-            score - ply as i32
+-        } else {
+-            score
+-        }
+-    }
+-
+-    #[inline]
+-    fn score_from_tt(score: i32, ply: u8) -> i32 {
+-        if score >= MATE_BOUND {
+-            score - ply as i32
+-        } else if score <= -MATE_BOUND {
+-            score + ply as i32
+-        } else {
+-            score
+-        }
+-    }
+-
+-    fn search(&mut self, board: &Board, depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
+-        info.nodes += 1;
+-
+-        // Длина PV для этого узла инициализируется сразу, чтобы родитель
+-        // никогда не читал устаревшее значение (в т.ч. при раннем выходе)
+-        self.pv_length[ply as usize] = ply as usize;
+-
+-        // Защита от выхода за границы массивов (check extension может не уменьшать глубину)
+-        if ply >= MAX_DEPTH - 1 {
+-            return Evaluator::evaluate(board);
+-        }
+-
+-        if info.poll() {
+-            return 0;
+-        }
+-
+-        // Check for draw by 50-move rule
+-        if board.halfmove_clock >= 100 {
+-            return 0;
+-        }
+-
+-        let is_pv_node = beta - alpha > 1;
+-        let hash = Zobrist::hash(board);
+-        let in_check = board.in_check();
+-
+-        // Повторение позиции внутри текущей ветки — считаем ничьёй
+-        self.path[ply as usize] = hash;
+-        if ply > 0 && self.path[..ply as usize].contains(&hash) {
+-            return 0;
+-        }
+-
+-        // Mate distance pruning
+-        alpha = alpha.max(-MATE_SCORE + ply as i32);
+-        beta = beta.min(MATE_SCORE - ply as i32 - 1);
+-        if alpha >= beta {
+-            return alpha;
+-        }
+-
+-        // Transposition table probe
+-        if let Some(tt_score) = self.tt.probe(hash, depth, alpha, beta) {
+-            if !is_pv_node && ply > 0 {
+-                return Self::score_from_tt(tt_score, ply);
+-            }
+-        }
+-
+-        // Quiescence search at leaf nodes
+-        if depth == 0 {
+-            return self.quiescence(board, alpha, beta, ply, info);
+-        }
+-
+-        // Статическая оценка считается один раз и используется всеми отсечениями
+-        let static_eval = if in_check { -INFINITY } else { Evaluator::evaluate(board) };
+-
+-        // Reverse futility pruning: позиция настолько хороша, что даже с запасом выше beta
+-        if !is_pv_node
+-            && !in_check
+-            && depth <= RFP_MAX_DEPTH
+-            && beta.abs() < MATE_BOUND
+-            && static_eval - RFP_MARGIN * depth as i32 >= beta
+-        {
+-            return static_eval - RFP_MARGIN * depth as i32;
+-        }
+-
+-        // Null Move Pruning - skip if in check or no non-pawn material (zugzwang)
+-        if do_null
+-            && ply > 0
+-            && !in_check
+-            && depth >= NULL_MOVE_MIN_DEPTH
+-            && static_eval >= beta
+-            && self.has_non_pawn_material(board)
+-            && beta.abs() < MATE_BOUND
+-        {
+-            let mut null_board = *board;
+-            null_board.side_to_move = null_board.side_to_move.opposite();
+-            null_board.en_passant_square = None;
+-
+-            // Адаптивная редукция: чем глубже, тем больше режем
+-            let r = NULL_MOVE_REDUCTION + depth / 4;
+-
+-            let null_score = -self.search(
+-                &null_board,
+-                depth.saturating_sub(r + 1),
+-                -beta,
+-                -beta + 1,
+-                ply + 1,
+-                false,
+-                info
+-            );
+-
+-            if info.stop {
+-                return 0;
+-            }
+-
+-            if null_score >= beta {
+-                // Null move cutoff (матовые счета из null move не доверяем)
+-                return if null_score >= MATE_BOUND { beta } else { null_score.min(beta) };
+-            }
+-        }
+-
+-        // Razoring - if eval is way below alpha, try qsearch
+-        if !is_pv_node
+-            && !in_check
+-            && depth <= 3
+-            && depth > 0
+-        {
+-            let razor_margin = RAZOR_MARGIN[depth as usize];
+-
+-            if static_eval + razor_margin < alpha {
+-                let qscore = self.quiescence(board, alpha - razor_margin, alpha - razor_margin + 1, ply, info);
+-                if info.stop {
+-                    return 0;
+-                }
+-                if qscore + razor_margin <= alpha {
+-                    return qscore;
+-                }
+-            }
+-        }
+-
+-        let moves = self.movegen.generate_moves(board);
+-
+-        // Checkmate/stalemate detection
+-        if moves.is_empty() {
+-            if in_check {
+-                return -MATE_SCORE + ply as i32; // Prefer faster mate
+-            } else {
+-                return 0; // Stalemate
+-            }
+-        }
+-
+-        // Move ordering for better pruning
+-        let ordered_moves = self.order_moves(moves, hash, ply);
+-
+-        let mut best_move = None;
+-        let original_alpha = alpha;
+-
+-        for (move_num, mv) in ordered_moves.iter().enumerate() {
+-            let mut new_board = *board;
+-            new_board.make_move(*mv);
+-
+-            let mut score;
+-            let gives_check = new_board.in_check();
+-            let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
+-
+-            // Check extension — ограничиваем, чтобы цепочки шахов не раздували дерево
+-            let extension: u8 = if gives_check
+-                && depth < MAX_DEPTH - 1
+-                && ply < self.root_depth.saturating_mul(2)
+-            {
+-                1
+-            } else {
+-                0
+-            };
+-
+-            // Futility Pruning - skip quiet moves that can't improve alpha
+-            if !is_pv_node
+-                && !in_check
+-                && !gives_check
+-                && depth <= 3
+-                && is_quiet
+-                && move_num > 0
+-                && alpha.abs() < MATE_BOUND
+-            {
+-                if static_eval + FUTILITY_MARGIN[depth as usize] <= alpha {
+-                    continue; // Skip this move
+-                }
+-            }
+-
+-            // SEE pruning for bad captures (только в непервичных узлах, чтобы не резать жертвы в PV)
+-            if !is_pv_node
+-                && move_num > 0
+-                && depth <= 5
+-                && mv.captured.is_some()
+-                && !gives_check
+-                && !in_check
+-            {
+-                let see_value = SEE::evaluate(board, mv.from, mv.to, mv.piece);
+-                if see_value < 0 {
+-                    continue; // Skip losing capture
+-                }
+-            }
+-
+-            if move_num == 0 {
+-                // Первый ход (обычно ход из TT) — полное окно
+-                score = -self.search(
+-                    &new_board,
+-                    depth - 1 + extension,
+-                    -beta,
+-                    -alpha,
+-                    ply + 1,
+-                    true,
+-                    info
+-                );
+-            } else {
+-                // Late Move Reductions (LMR)
+-                let mut reduction: u8 = 0;
+-                if move_num >= LMR_FULL_DEPTH_MOVES
+-                    && depth >= LMR_MIN_DEPTH
+-                    && !in_check
+-                    && !gives_check
+-                    && is_quiet
+-                {
+-                    let mut r = (0.7 + (depth as f32).ln() * ((move_num + 1) as f32).ln() / 2.25) as u8;
+-                    if is_pv_node {
+-                        r = r.saturating_sub(1);
+-                    }
+-                    reduction = r.max(1).min(depth - 1);
+-                }
+-
+-                // PVS: сначала нулевое окно (с редукцией, если она есть)
+-                score = -self.search(
+-                    &new_board,
+-                    depth - 1 - reduction + extension,
+-                    -alpha - 1,
+-                    -alpha,
+-                    ply + 1,
+-                    true,
+-                    info
+-                );
+-
+-                // Редуцированный поиск «понравился» — проверяем на полной глубине
+-                if score > alpha && reduction > 0 {
+-                    score = -self.search(
+-                        &new_board,
+-                        depth - 1 + extension,
+-                        -alpha - 1,
+-                        -alpha,
+-                        ply + 1,
+-                        true,
+-                        info
+-                    );
+-                }
+-
+-                // Ход улучшает alpha в PV-узле — перепроверка с полным окном
+-                if score > alpha && score < beta {
+-                    score = -self.search(
+-                        &new_board,
+-                        depth - 1 + extension,
+-                        -beta,
+-                        -alpha,
+-                        ply + 1,
+-                        true,
+-                        info
+-                    );
+-                }
+-            }
+-
+-            // Поиск был прерван по времени — результат мусорный, ничего не сохраняем (ни в TT, ни в историю)
+-            if info.stop {
+-                return 0;
+-            }
+-
+-            if score >= beta {
+-                // Beta cutoff
+-                if mv.captured.is_none() {
+-                    self.store_killer_move(*mv, ply);
+-                    // i32 вместо u8: (depth * depth) в u8 переполняется при depth >= 16
+-                    let bonus = (depth as i32) * (depth as i32);
+-                    let h = &mut self.history_table[mv.from as usize][mv.to as usize];
+-                    *h += bonus;
+-                    if *h > HISTORY_LIMIT {
+-                        for row in self.history_table.iter_mut() {
+-                            for v in row.iter_mut() {
+-                                *v /= 2;
+-                            }
+-                        }
+-                    }
+-                }
+-
+-                // Ход отсечения обязательно записываем в PV: в корне (мат в 1 упирается
+-                // в границу beta) иначе в pv_table[0][0] остаётся ход из прошлого поиска
+-                self.pv_table[ply as usize][ply as usize] = Some(*mv);
+-                self.pv_length[ply as usize] = ply as usize + 1;
+-
+-                self.tt.store(hash, depth, Self::score_to_tt(beta, ply), NodeType::LowerBound, Some(*mv));
+-                return beta;
+-            }
+-
+-            if score > alpha {
+-                alpha = score;
+-                best_move = Some(*mv);
+-
+-                // Update PV
+-                self.pv_table[ply as usize][ply as usize] = Some(*mv);
+-                for i in (ply + 1)..(self.pv_length[(ply + 1) as usize] as u8) {
+-                    self.pv_table[ply as usize][i as usize] = self.pv_table[(ply + 1) as usize][i as usize];
+-                }
+-                self.pv_length[ply as usize] = self.pv_length[(ply + 1) as usize];
+-            }
+-        }
+-
+-        // Store in transposition table
+-        let node_type = if alpha > original_alpha {
+-            NodeType::Exact
+-        } else {
+-            NodeType::UpperBound
+-        };
+-        self.tt.store(hash, depth, Self::score_to_tt(alpha, ply), node_type, best_move);
+-
+-        alpha
+-    }
+-
+-    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32, ply: u8, info: &mut SearchInfo) -> i32 {
+-        info.nodes += 1;
+-
+-        if info.poll() {
+-            return 0;
+-        }
+-
+-        if ply >= MAX_DEPTH - 1 {
+-            return Evaluator::evaluate(board);
+-        }
+-
+-        let in_check = board.in_check();
+-        let mut stand_pat = -INFINITY;
+-
+-        // Под шахом «стоять» нельзя — надо рассматривать все уклонения
+-        if !in_check {
+-            stand_pat = Evaluator::evaluate(board);
+-
+-            if stand_pat >= beta {
+-                return beta;
+-            }
+-
+-            // Delta pruning - if even capturing queen can't raise alpha
+-            const QUEEN_VALUE: i32 = 900;
+-            if stand_pat < alpha - QUEEN_VALUE {
+-                return alpha;
+-            }
+-
+-            if alpha < stand_pat {
+-                alpha = stand_pat;
+-            }
+-        }
+-
+-        let moves = self.movegen.generate_moves(board);
+-
+-        if in_check && moves.is_empty() {
+-            return -MATE_SCORE + ply as i32;
+-        }
+-
+-        let mut captures: Vec<Move> = if in_check {
+-            moves
+-        } else {
+-            // Взятия и превращения в ферзя
+-            moves
+-                .into_iter()
+-                .filter(|m| m.captured.is_some() || matches!(m.promotion, Some(Piece::Queen)))
+-                .collect()
+-        };
+-
+-        // MVV-LVA ordering
+-        captures.sort_by_key(|mv| {
+-            let victim_value = mv.captured.map(Self::piece_value).unwrap_or(0);
+-            let attacker_value = Self::piece_value(mv.piece);
+-            let promo = if mv.promotion.is_some() { 800 } else { 0 };
+-            -(victim_value * 10 - attacker_value / 10 + promo)
+-        });
+-
+-        for mv in captures {
+-            if !in_check {
+-                if let Some(victim) = mv.captured {
+-                    // Покадровый delta pruning: даже с запасом взятие не дотягивает до alpha
+-                    if mv.promotion.is_none() && stand_pat + Self::piece_value(victim) + 200 < alpha {
+-                        continue;
+-                    }
+-                    // Заведомо проигрышные взятия в qsearch не рассматриваем
+-                    if mv.promotion.is_none() && SEE::evaluate(board, mv.from, mv.to, mv.piece) < 0 {
+-                        continue;
+-                    }
+-                }
+-            }
+-
+-            let mut new_board = *board;
+-            new_board.make_move(mv);
+-
+-            let score = -self.quiescence(&new_board, -beta, -alpha, ply + 1, info);
+-
+-            if info.stop {
+-                return 0;
+-            }
+-
+-            if score >= beta {
+-                return beta;
+-            }
+-
+-            if score > alpha {
+-                alpha = score;
+-            }
+-        }
+-
+-        alpha
+-    }
+-
+-    #[inline]
+-    fn piece_value(p: Piece) -> i32 {
+-        match p {
+-            Piece::Pawn => 100,
+-            Piece::Knight => 320,
+-            Piece::Bishop => 330,
+-            Piece::Rook => 500,
+-            Piece::Queen => 900,
+-            Piece::King => 20000,
+-        }
+-    }
+-
+-    fn order_moves(&self, mut moves: Vec<Move>, hash: u64, ply: u8) -> Vec<Move> {
+-        // Ход из TT ищем один раз, а не для каждого хода в сортировке
+-        let tt_move = self.tt.get_best_move(hash);
+-
+-        moves.sort_by_cached_key(|mv| {
+-            // Приоритеты: TT > взятия (MVV-LVA) > превращения > киллеры > история
+-            if let Some(tt_mv) = tt_move {
+-                if tt_mv.from == mv.from && tt_mv.to == mv.to {
+-                    return -10_000_000;
+-                }
+-            }
+-
+-            let mut score = 0;
+-
+-            if let Some(captured) = mv.captured {
+-                score += 2_000_000 + Self::piece_value(captured) * 10 - Self::piece_value(mv.piece) / 10;
+-            }
+-
+-            if mv.promotion.is_some() {
+-                score += 1_900_000;
+-            }
+-
+-            if mv.captured.is_none() {
+-                if ply < MAX_DEPTH {
+-                    for (i, killer) in self.killer_moves[ply as usize].iter().enumerate() {
+-                        if let Some(k) = killer {
+-                            if k.from == mv.from && k.to == mv.to {
+-                                score += 1_000_000 - (i as i32) * 100_000;
+-                                break;
+-                            }
+-                        }
+-                    }
+-                }
+-
+-                // История всегда меньше киллеров и взятий (ограничена HISTORY_LIMIT)
+-                score += self.history_table[mv.from as usize][mv.to as usize].min(HISTORY_LIMIT);
+-            }
+-
+-            -score
+-        });
+-
+-        moves
+-    }
+-
+-    fn store_killer_move(&mut self, mv: Move, ply: u8) {
+-        if ply >= MAX_DEPTH {
+-            return;
+-        }
+-
+-        let killers = &mut self.killer_moves[ply as usize];
+-
+-        if let Some(first) = killers[0] {
+-            if first.from != mv.from || first.to != mv.to {
+-                killers[1] = Some(first);
+-                killers[0] = Some(mv);
+-            }
+-        } else {
+-            killers[0] = Some(mv);
+-        }
+-    }
+-
+-    /// Есть ли у стороны, которая ходит, хоть одна фигура кроме пешек и короля.
+-    /// Если нет — null move опасен (цугцванг).
+-    fn has_non_pawn_material(&self, board: &Board) -> bool {
+-        let side = board.side_to_move as usize;
+-        for piece in 1..5 {
+-            if board.pieces[side][piece] != 0 {
+-                return true;
+-            }
+-        }
+-        false
+-    }
+-
+-    fn format_pv_line(&self) -> String {
+-        let mut pv = String::new();
+-        for i in 0..self.pv_length[0] {
+-            if let Some(mv) = self.pv_table[0][i] {
+-                if !pv.is_empty() {
+-                    pv.push(' ');
+-                }
+-                pv.push_str(&self.format_move(&mv));
+-            }
+-        }
+-        pv
+-    }
+-
+-    fn format_move(&self, mv: &Move) -> String {
+-        let from = Self::square_to_algebraic(mv.from);
+-        let to = Self::square_to_algebraic(mv.to);
+-
+-        if let Some(promo) = mv.promotion {
+-            let promo_char = match promo {
+-                Piece::Queen => 'q',
+-                Piece::Rook => 'r',
+-                Piece::Bishop => 'b',
+-                Piece::Knight => 'n',
+-                _ => 'q',
+-            };
+-            format!("{}{}{}", from, to, promo_char)
+-        } else {
+-            format!("{}{}", from, to)
+-        }
+-    }
+-
+-    fn square_to_algebraic(square: u8) -> String {
+-        let file = (b'a' + (square % 8)) as char;
+-        let rank = (b'1' + (square / 8)) as char;
+-        format!("{}{}", file, rank)
+-    }
+-
+-    pub fn clear_tt(&mut self) {
+-        self.tt.clear();
+-        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
+-        self.history_table = [[0; 64]; 64];
+-    }
+-}
+-
+-impl Default for Search {
+-    fn default() -> Self {
+-        Self::new()
+-    }
+-}
+\ No newline at end of file
++use crate::board::{Board, Move, Piece};
++use crate::movegen::MoveGenerator;
++use crate::evaluation::Evaluator;
++use crate::magic::MagicBitboards;
++use crate::zobrist::Zobrist;
++use crate::transposition::{TranspositionTable, NodeType};
++use crate::see::SEE;
++use std::time::{Duration, Instant};
++
++const MAX_DEPTH: u8 = 64;
++const INFINITY: i32 = 1_000_000;
++const MATE_SCORE: i32 = 900_000;
++const MATE_BOUND: i32 = MATE_SCORE - 1000; // всё, что дальше этой границы, считаем матовым счётом
++
++// Null Move Pruning parameters
++const NULL_MOVE_REDUCTION: u8 = 2;
++const NULL_MOVE_MIN_DEPTH: u8 = 3;
++
++// Late Move Reductions parameters
++const LMR_MIN_DEPTH: u8 = 3;
++const LMR_FULL_DEPTH_MOVES: usize = 4;
++
++// Futility Pruning margins
++const FUTILITY_MARGIN: [i32; 4] = [0, 200, 300, 500];
++
++// Razoring margins
++const RAZOR_MARGIN: [i32; 4] = [0, 300, 400, 600];
++
++// Reverse futility (static null move) — маржа за единицу глубины
++const RFP_MARGIN: i32 = 100;
++const RFP_MAX_DEPTH: u8 = 5;
++
++// Верхняя граница для таблицы истории (чтобы она не перебивала взятия и киллеры)
++const HISTORY_LIMIT: i32 = 400_000;
++
++// Late Move Pruning: сколько тихих ходов ищем полностью на глубинах 1..=3
++const LMP_LIMIT: [usize; 4] = [0, 6, 10, 15];
++
++pub struct SearchInfo {
++    pub nodes: u64,
++    pub start_time: Instant,
++    pub time_limit: Option<Duration>,
++    pub stop: bool,
++}
++
++impl SearchInfo {
++    pub fn new() -> Self {
++        Self {
++            nodes: 0,
++            start_time: Instant::now(),
++            time_limit: None,
++            stop: false,
++        }
++    }
++
++    /// Полная проверка (используется вне горячего пути)
++    pub fn should_stop(&self) -> bool {
++        if self.stop {
++            return true;
++        }
++        if let Some(limit) = self.time_limit {
++            if self.start_time.elapsed() >= limit {
++                return true;
++            }
++        }
++        false
++    }
++
++    /// Дешёвая проверка для горячего пути: часы читаем раз в 2048 узлов,
++    /// а при истечении времени взводим флаг `stop`, который уже не сбрасывается.
++    #[inline]
++    fn poll(&mut self) -> bool {
++        if self.stop {
++            return true;
++        }
++        if self.nodes & 2047 == 0 {
++            if let Some(limit) = self.time_limit {
++                if self.start_time.elapsed() >= limit {
++                    self.stop = true;
++                }
++            }
++        }
++        self.stop
++    }
++}
++
++pub struct Search {
++    movegen: MoveGenerator,
++    tt: TranspositionTable,
++    killer_moves: [[Option<Move>; 2]; MAX_DEPTH as usize],
++    history_table: [[i32; 64]; 64], // [from][to]
++    pv_table: [[Option<Move>; MAX_DEPTH as usize]; MAX_DEPTH as usize], // Principal Variation
++    pv_length: [usize; MAX_DEPTH as usize],
++    path: [u64; MAX_DEPTH as usize],   // хэши позиций на текущей ветке (для повторений)
++    game_history: Vec<u64>,            // хэши позиций партии (повторения с учётом истории)
++    root_depth: u8,
++}
++
++impl Search {
++    pub fn new() -> Self {
++        Self {
++            movegen: MoveGenerator::new(),
++            tt: TranspositionTable::new_default(),
++            killer_moves: [[None; 2]; MAX_DEPTH as usize],
++            history_table: [[0; 64]; 64],
++            pv_table: [[None; MAX_DEPTH as usize]; MAX_DEPTH as usize],
++            pv_length: [0; MAX_DEPTH as usize],
++            path: [0; MAX_DEPTH as usize],
++            game_history: Vec::new(),
++            root_depth: 0,
++        }
++    }
++
++    /// Пересоздание TT по запросу `setoption name Hash value N` (в МБ)
++    pub fn set_hash_size(&mut self, size_mb: usize) {
++        self.tt = TranspositionTable::new(size_mb);
++    }
++
++    pub fn find_best_move(
++        &mut self,
++        board: &Board,
++        depth: u8,
++        time_limit: Option<Duration>,
++        game_history: &[u64],
++    ) -> Option<Move> {
++        let mut info = SearchInfo::new();
++        info.time_limit = time_limit;
++
++        let depth = depth.min(MAX_DEPTH - 4);
++        self.game_history = game_history.to_vec();
++
++        let mut best_move = None;
++        let mut best_score;
++        let mut prev_score = 0;
++
++        self.tt.new_search();
++
++        // Киллеры устаревают между ходами, историю старим (делим пополам)
++        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
++        for row in self.history_table.iter_mut() {
++            for h in row.iter_mut() {
++                *h /= 2;
++            }
++        }
++
++        // Iterative deepening with aspiration windows
++        for current_depth in 1..=depth {
++            if info.should_stop() {
++                break;
++            }
++
++            // Не начинаем новую итерацию, если съедено >60% времени:
++            // следующая итерация всё равно не успеет закончиться
++            if current_depth > 1 && best_move.is_some() {
++                if let Some(limit) = info.time_limit {
++                    if info.start_time.elapsed() * 10 >= limit * 6 {
++                        break;
++                    }
++                }
++            }
++
++            self.root_depth = current_depth;
++
++            // Aspiration window для глубин >= 5
++            let (mut alpha, mut beta) = if current_depth >= 5 {
++                (prev_score - 50, prev_score + 50)
++            } else {
++                (-INFINITY, INFINITY)
++            };
++            let mut delta = 100i32;
++            let mut researches = 0;
++
++            loop {
++                best_score = self.search(board, current_depth, alpha, beta, 0, true, &mut info);
++
++                if info.should_stop() {
++                    break;
++                }
++
++                // Плавное расширение окна вместо прыжка к ±бесконечности:
++                // так переисследования дешевле
++                if best_score <= alpha {
++                    researches += 1;
++                    if researches >= 3 || prev_score.abs() >= MATE_BOUND {
++                        alpha = -INFINITY;
++                        beta = INFINITY;
++                    } else {
++                        beta = ((alpha + beta) / 2).min(INFINITY);
++                        alpha = (alpha - delta).max(-INFINITY);
++                        delta += delta / 2;
++                    }
++                } else if best_score >= beta {
++                    researches += 1;
++                    if researches >= 3 || prev_score.abs() >= MATE_BOUND {
++                        alpha = -INFINITY;
++                        beta = INFINITY;
++                    } else {
++                        alpha = ((alpha + beta) / 2).max(-INFINITY);
++                        beta = (beta + delta).min(INFINITY);
++                        delta += delta / 2;
++                    }
++                } else {
++                    // Score is within window
++                    break;
++                }
++            }
++
++            if !info.should_stop() {
++                prev_score = best_score;
++                best_move = self.pv_table[0][0];
++
++                // UCI info output with PV line.
++                // Печатаем ВСЕГДА (даже без хода): при матах/патах в корне
++                // pv_table пуст, но счёт нужен GUI и инструментам анализа.
++                let elapsed = info.start_time.elapsed().as_millis();
++                let nps = if elapsed > 0 {
++                    (info.nodes as u128 * 1000) / elapsed
++                } else {
++                    0
++                };
++
++                let pv_str = self.format_pv_line();
++                let pv_part = if pv_str.is_empty() {
++                    String::new()
++                } else {
++                    format!(" pv {}", pv_str)
++                };
++                let score_str = if best_score.abs() >= MATE_BOUND {
++                    let plies = (MATE_SCORE - best_score.abs()) as u32;
++                    let moves = (plies + 1) / 2;
++                    if best_score > 0 {
++                        format!("mate {}", moves)
++                    } else {
++                        format!("mate -{}", moves)
++                    }
++                } else {
++                    format!("cp {}", best_score)
++                };
++
++                println!(
++                    "info depth {} score {} nodes {} time {} nps {} hashfull {}{}",
++                    current_depth,
++                    score_str,
++                    info.nodes,
++                    elapsed,
++                    nps,
++                    (self.tt.usage() * 10.0) as u32,
++                    pv_part
++                );
++            }
++        }
++
++        // Страховка: отдаём только легальный ход. Если найденного хода нет среди
++        // легальных (или его нет вовсе) — берём лучший по упрощённой сортировке.
++        let mut legal = self.movegen.generate_moves(board);
++        if let Some(bm) = best_move {
++            let key = self.format_move(&bm);
++            if let Some(found) = legal.iter().find(|m| self.format_move(m) == key) {
++                return Some(*found);
++            }
++        }
++
++        legal.sort_by_key(|m| {
++            let mut s = 0;
++            if let Some(c) = m.captured {
++                s -= 1_000_000 + Self::piece_value(c);
++            }
++            if m.promotion.is_some() {
++                s -= 900_000;
++            }
++            if m.captured.is_none() {
++                s -= self.history_table[m.from as usize][m.to as usize];
++            }
++            s
++        });
++        legal.into_iter().next()
++    }
++
++    #[inline]
++    fn score_to_tt(score: i32, ply: u8) -> i32 {
++        if score >= MATE_BOUND {
++            score + ply as i32
++        } else if score <= -MATE_BOUND {
++            score - ply as i32
++        } else {
++            score
++        }
++    }
++
++    #[inline]
++    fn score_from_tt(score: i32, ply: u8) -> i32 {
++        if score >= MATE_BOUND {
++            score - ply as i32
++        } else if score <= -MATE_BOUND {
++            score + ply as i32
++        } else {
++            score
++        }
++    }
++
++    fn search(&mut self, board: &Board, mut depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
++        info.nodes += 1;
++
++        // Длина PV для этого узла инициализируется сразу, чтобы родитель
++        // никогда не читал устаревшее значение (в т.ч. при раннем выходе)
++        self.pv_length[ply as usize] = ply as usize;
++
++        // Защита от выхода за границы массивов (check extension может не уменьшать глубину)
++        if ply >= MAX_DEPTH - 1 {
++            return Evaluator::evaluate(board);
++        }
++
++        if info.poll() {
++            return 0;
++        }
++
++        let is_pv_node = beta - alpha > 1;
++        let hash = board.hash; // инкрементальный хэш — без пересчёта с нуля
++        let in_check = board.in_check();
++
++        // Правило 50 ходов. Мат важнее ничьей: под шахом проверяем, есть ли мат.
++        if board.halfmove_clock >= 100 {
++            if in_check {
++                let escapes = self.movegen.generate_moves(board);
++                return if escapes.is_empty() {
++                    -MATE_SCORE + ply as i32
++                } else {
++                    0
++                };
++            }
++            return 0;
++        }
++
++        // Повторения позиции: внутри текущей ветки поиска и в истории партии.
++        // Проверяем только последние `halfmove_clock` полуходов — раньше
++        // необратимый ход сделал повторение невозможным.
++        if ply > 0 && board.halfmove_clock >= 4 {
++            let hmc = board.halfmove_clock as usize;
++            let lo = (ply as usize).saturating_sub(hmc);
++            if self.path[lo..ply as usize].contains(&hash) {
++                return 0;
++            }
++            let hist_start = self.game_history.len().saturating_sub(hmc);
++            if self.game_history[hist_start..].contains(&hash) {
++                return 0;
++            }
++        }
++
++        // Материальная ничья: K против K, K+лёгкая против K и т.п.
++        if Self::is_insufficient_material(board) {
++            return 0;
++        }
++
++        // Mate distance pruning
++        alpha = alpha.max(-MATE_SCORE + ply as i32);
++        beta = beta.min(MATE_SCORE - ply as i32 - 1);
++        if alpha >= beta {
++            return alpha;
++        }
++
++        // Transposition table probe
++        if let Some(tt_score) = self.tt.probe(hash, depth, alpha, beta) {
++            if !is_pv_node && ply > 0 {
++                return Self::score_from_tt(tt_score, ply);
++            }
++        }
++
++        // Quiescence search at leaf nodes
++        if depth == 0 {
++            return self.quiescence(board, alpha, beta, ply, info);
++        }
++
++        // Internal Iterative Reduction: в узле нет хода из TT — нет и хорошего
++        // кандидата для сортировки, урезаем глубину, чтобы не строить дерево вслепую
++        let tt_move = self.tt.get_best_move(hash);
++        if tt_move.is_none() && depth >= 4 {
++            depth -= 1;
++        }
++
++        // Статическая оценка считается один раз и используется всеми отсечениями
++        let static_eval = if in_check { -INFINITY } else { Evaluator::evaluate(board) };
++
++        // Reverse futility pruning: позиция настолько хороша, что даже с запасом выше beta
++        if !is_pv_node
++            && !in_check
++            && depth <= RFP_MAX_DEPTH
++            && beta.abs() < MATE_BOUND
++            && static_eval - RFP_MARGIN * depth as i32 >= beta
++        {
++            return static_eval - RFP_MARGIN * depth as i32;
++        }
++
++        // Null Move Pruning - skip if in check or no non-pawn material (zugzwang)
++        if do_null
++            && ply > 0
++            && !in_check
++            && depth >= NULL_MOVE_MIN_DEPTH
++            && static_eval >= beta
++            && self.has_non_pawn_material(board)
++            && beta.abs() < MATE_BOUND
++        {
++            let mut null_board = *board;
++            null_board.side_to_move = null_board.side_to_move.opposite();
++            null_board.en_passant_square = None;
++            // null-move меняет сторону и сбрасывает ep — корректируем хэш
++            null_board.hash = Zobrist::null_move_hash(board);
++
++            // Адаптивная редукция: чем глубже, тем больше режем
++            let r = NULL_MOVE_REDUCTION + depth / 4;
++
++            let null_score = -self.search(
++                &null_board,
++                depth.saturating_sub(r + 1),
++                -beta,
++                -beta + 1,
++                ply + 1,
++                false,
++                info
++            );
++
++            if info.stop {
++                return 0;
++            }
++
++            if null_score >= beta {
++                // Null move cutoff (матовые счета из null move не доверяем)
++                return if null_score >= MATE_BOUND { beta } else { null_score.min(beta) };
++            }
++        }
++
++        // Razoring - if eval is way below alpha, try qsearch
++        if !is_pv_node
++            && !in_check
++            && depth <= 3
++            && depth > 0
++        {
++            let razor_margin = RAZOR_MARGIN[depth as usize];
++
++            if static_eval + razor_margin < alpha {
++                let qscore = self.quiescence(board, alpha - razor_margin, alpha - razor_margin + 1, ply, info);
++                if info.stop {
++                    return 0;
++                }
++                if qscore + razor_margin <= alpha {
++                    return qscore;
++                }
++            }
++        }
++
++        let moves = self.movegen.generate_moves(board);
++
++        // Checkmate/stalemate detection
++        if moves.is_empty() {
++            if in_check {
++                return -MATE_SCORE + ply as i32; // Prefer faster mate
++            } else {
++                return 0; // Stalemate
++            }
++        }
++
++        // Move ordering for better pruning
++        let ordered_moves = self.order_moves(moves, tt_move, ply);
++
++        let mut best_move = None;
++        let original_alpha = alpha;
++        let mut quiet_count: usize = 0;
++
++        for (move_num, mv) in ordered_moves.iter().enumerate() {
++            let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
++            // Даёт ли ход шах — считаем ДО make_move (дёшево), чтобы отсечения
++            // не тратили время на применение хода
++            let gives_check = Self::move_gives_check(board, mv);
++
++            // Late Move Pruning: на малых глубинах тихие ходы после лимита не ищем
++            if !is_pv_node
++                && !in_check
++                && !gives_check
++                && is_quiet
++                && depth <= 3
++                && move_num > 0
++                && quiet_count >= LMP_LIMIT[depth as usize]
++            {
++                continue;
++            }
++
++            // Futility Pruning - skip quiet moves that can't improve alpha
++            if !is_pv_node
++                && !in_check
++                && !gives_check
++                && depth <= 3
++                && is_quiet
++                && move_num > 0
++                && alpha.abs() < MATE_BOUND
++                && static_eval + FUTILITY_MARGIN[depth as usize] <= alpha
++            {
++                continue; // Skip this move
++            }
++
++            // SEE pruning for bad captures (только в непервичных узлах, чтобы не резать жертвы в PV)
++            if !is_pv_node
++                && move_num > 0
++                && depth <= 5
++                && mv.captured.is_some()
++                && !gives_check
++                && !in_check
++            {
++                if SEE::evaluate(board, mv) < 0 {
++                    continue; // Skip losing capture
++                }
++            }
++
++            let mut new_board = *board;
++            new_board.make_move(*mv);
++            if is_quiet {
++                quiet_count += 1;
++            }
++
++            // Check extension — ограничиваем, чтобы цепочки шахов не раздували дерево
++            let extension: u8 = if gives_check
++                && depth < MAX_DEPTH - 1
++                && ply < self.root_depth.saturating_mul(2)
++            {
++                1
++            } else {
++                0
++            };
++
++            let mut score;
++            if move_num == 0 {
++                // Первый ход (обычно ход из TT) — полное окно
++                score = -self.search(
++                    &new_board,
++                    depth - 1 + extension,
++                    -beta,
++                    -alpha,
++                    ply + 1,
++                    true,
++                    info
++                );
++            } else {
++                // Late Move Reductions (LMR)
++                let mut reduction: u8 = 0;
++                if move_num >= LMR_FULL_DEPTH_MOVES
++                    && depth >= LMR_MIN_DEPTH
++                    && !in_check
++                    && !gives_check
++                    && is_quiet
++                {
++                    let mut r = (0.7 + (depth as f32).ln() * ((move_num + 1) as f32).ln() / 2.25) as u8;
++                    if is_pv_node {
++                        r = r.saturating_sub(1);
++                    }
++                    reduction = r.max(1).min(depth - 1);
++                }
++
++                // PVS: сначала нулевое окно (с редукцией, если она есть)
++                score = -self.search(
++                    &new_board,
++                    depth - 1 - reduction + extension,
++                    -alpha - 1,
++                    -alpha,
++                    ply + 1,
++                    true,
++                    info
++                );
++
++                // Редуцированный поиск «понравился» — проверяем на полной глубине
++                if score > alpha && reduction > 0 {
++                    score = -self.search(
++                        &new_board,
++                        depth - 1 + extension,
++                        -alpha - 1,
++                        -alpha,
++                        ply + 1,
++                        true,
++                        info
++                    );
++                }
++
++                // Ход улучшает alpha в PV-узле — перепроверка с полным окном
++                if score > alpha && score < beta {
++                    score = -self.search(
++                        &new_board,
++                        depth - 1 + extension,
++                        -beta,
++                        -alpha,
++                        ply + 1,
++                        true,
++                        info
++                    );
++                }
++            }
++
++            // Поиск был прерван по времени — результат мусорный, ничего не сохраняем (ни в TT, ни в историю)
++            if info.stop {
++                return 0;
++            }
++
++            if score >= beta {
++                // Beta cutoff
++                if mv.captured.is_none() {
++                    self.store_killer_move(*mv, ply);
++                    // i32 вместо u8: (depth * depth) в u8 переполняется при depth >= 16
++                    let bonus = (depth as i32) * (depth as i32);
++                    let h = &mut self.history_table[mv.from as usize][mv.to as usize];
++                    *h += bonus;
++                    if *h > HISTORY_LIMIT {
++                        for row in self.history_table.iter_mut() {
++                            for v in row.iter_mut() {
++                                *v /= 2;
++                            }
++                        }
++                    }
++                }
++
++                // Ход отсечения обязательно записываем в PV: в корне (мат в 1 упирается
++                // в границу beta) иначе в pv_table[0][0] остаётся ход из прошлого поиска
++                self.pv_table[ply as usize][ply as usize] = Some(*mv);
++                self.pv_length[ply as usize] = ply as usize + 1;
++
++                self.tt.store(hash, depth, Self::score_to_tt(beta, ply), NodeType::LowerBound, Some(*mv));
++                return beta;
++            }
++
++            if score > alpha {
++                alpha = score;
++                best_move = Some(*mv);
++
++                // Update PV
++                self.pv_table[ply as usize][ply as usize] = Some(*mv);
++                for i in (ply + 1)..(self.pv_length[(ply + 1) as usize] as u8) {
++                    self.pv_table[ply as usize][i as usize] = self.pv_table[(ply + 1) as usize][i as usize];
++                }
++                self.pv_length[ply as usize] = self.pv_length[(ply + 1) as usize];
++            }
++        }
++
++        // Store in transposition table
++        let node_type = if alpha > original_alpha {
++            NodeType::Exact
++        } else {
++            NodeType::UpperBound
++        };
++        self.tt.store(hash, depth, Self::score_to_tt(alpha, ply), node_type, best_move);
++
++        alpha
++    }
++
++    fn quiescence(&mut self, board: &Board, mut alpha: i32, beta: i32, ply: u8, info: &mut SearchInfo) -> i32 {
++        info.nodes += 1;
++
++        if info.poll() {
++            return 0;
++        }
++
++        if ply >= MAX_DEPTH - 1 {
++            return Evaluator::evaluate(board);
++        }
++
++        let in_check = board.in_check();
++        let mut stand_pat = -INFINITY;
++
++        // Под шахом «стоять» нельзя — надо рассматривать все уклонения
++        if !in_check {
++            stand_pat = Evaluator::evaluate(board);
++
++            if stand_pat >= beta {
++                return beta;
++            }
++
++            // Delta pruning - if even capturing queen can't raise alpha
++            const QUEEN_VALUE: i32 = 900;
++            if stand_pat < alpha - QUEEN_VALUE {
++                return alpha;
++            }
++
++            if alpha < stand_pat {
++                alpha = stand_pat;
++            }
++        }
++
++        let moves = self.movegen.generate_moves(board);
++
++        if in_check && moves.is_empty() {
++            return -MATE_SCORE + ply as i32;
++        }
++
++        let mut captures: Vec<Move> = if in_check {
++            moves
++        } else {
++            // Взятия и превращения в ферзя
++            moves
++                .into_iter()
++                .filter(|m| m.captured.is_some() || matches!(m.promotion, Some(Piece::Queen)))
++                .collect()
++        };
++
++        // MVV-LVA ordering
++        captures.sort_by_key(|mv| {
++            let victim_value = mv.captured.map(Self::piece_value).unwrap_or(0);
++            let attacker_value = Self::piece_value(mv.piece);
++            let promo = if mv.promotion.is_some() { 800 } else { 0 };
++            -(victim_value * 10 - attacker_value / 10 + promo)
++        });
++
++        for mv in captures {
++            if !in_check {
++                if let Some(victim) = mv.captured {
++                    // Покадровый delta pruning: даже с запасом взятие не дотягивает до alpha
++                    if mv.promotion.is_none() && stand_pat + Self::piece_value(victim) + 200 < alpha {
++                        continue;
++                    }
++                    // Заведомо проигрышные взятия в qsearch не рассматриваем
++                    // (SEE теперь корректный: RxP/QxR и т.п. больше не «проигрыш»)
++                    if mv.promotion.is_none() && SEE::evaluate(board, &mv) < 0 {
++                        continue;
++                    }
++                }
++            }
++
++            let mut new_board = *board;
++            new_board.make_move(mv);
++
++            let score = -self.quiescence(&new_board, -beta, -alpha, ply + 1, info);
++
++            if info.stop {
++                return 0;
++            }
++
++            if score >= beta {
++                return beta;
++            }
++
++            if score > alpha {
++                alpha = score;
++            }
++        }
++
++        alpha
++    }
++
++    /// Даёт ли ход шах БЕЗ применения хода. Дешёвые magic-лукапы вместо
++    /// копирования доски и make_move.
++    fn move_gives_check(board: &Board, mv: &Move) -> bool {
++        let magic = MagicBitboards::get();
++        let gen = MoveGenerator::get();
++        let us = board.side_to_move as usize;
++        let them = 1 - us;
++
++        let king_bb = board.pieces[them][Piece::King as usize];
++        if king_bb == 0 {
++            return false;
++        }
++        let ksq = king_bb.trailing_zeros() as usize;
++        let from_bb = 1u64 << mv.from;
++        let mut occ = board.all_occupied & !from_bb;
++
++        // При en passant уходит ещё и взятая пешка — с её клетки тоже может
++        // вскрыться линия на короля
++        if mv.is_en_passant {
++            let cap_sq = if us == 0 { mv.to - 8 } else { mv.to + 8 };
++            occ &= !(1u64 << cap_sq);
++        }
++
++        // Рокировка: шах может дать только ладья, вставшая на новую вертикаль
++        if mv.is_castle {
++            let (rf, rt) = match mv.to {
++                6 => (7usize, 5usize),
++                2 => (0, 3),
++                62 => (63, 61),
++                58 => (56, 59),
++                _ => (0, 0),
++            };
++            let occ2 = occ & !(1u64 << rf);
++            return magic.get_rook_attacks(rt, occ2) & king_bb != 0;
++        }
++
++        // Прямой шах: фигура (с учётом превращения) бьёт короля с поля `to`
++        let eff = mv.promotion.unwrap_or(mv.piece);
++        let direct = match eff {
++            Piece::Pawn => gen.pawn_attacks_at(us, mv.to as usize) & king_bb != 0,
++            Piece::Knight => gen.knight_attacks_at(mv.to as usize) & king_bb != 0,
++            Piece::Bishop => magic.get_bishop_attacks(mv.to as usize, occ) & king_bb != 0,
++            Piece::Rook => magic.get_rook_attacks(mv.to as usize, occ) & king_bb != 0,
++            Piece::Queen => {
++                (magic.get_bishop_attacks(mv.to as usize, occ)
++                    | magic.get_rook_attacks(mv.to as usize, occ))
++                    & king_bb
++                    != 0
++            }
++            Piece::King => false,
++        };
++        if direct {
++            return true;
++        }
++
++        // Вскрытый шах: ушедшая фигура открывала линию своей же тяжёлой/лёгкой фигуре.
++        // Саму уходящую фигуру исключаем (её бит ещё стоит на from в битбордах доски).
++        let diag = (board.pieces[us][Piece::Bishop as usize]
++            | board.pieces[us][Piece::Queen as usize])
++            & !from_bb;
++        let orth = (board.pieces[us][Piece::Rook as usize]
++            | board.pieces[us][Piece::Queen as usize])
++            & !from_bb;
++
++        (magic.get_bishop_attacks(ksq, occ) & diag != 0)
++            || (magic.get_rook_attacks(ksq, occ) & orth != 0)
++    }
++
++    /// Материальная ничья: нет пешек/ладей/ферзей и у каждой стороны максимум
++    /// одна лёгкая фигура (KvK, KNvK, KBvK, KMNvKMN).
++    fn is_insufficient_material(board: &Board) -> bool {
++        let p = Piece::Pawn as usize;
++        let r = Piece::Rook as usize;
++        let q = Piece::Queen as usize;
++        if board.pieces[0][p] != 0 || board.pieces[1][p] != 0 {
++            return false;
++        }
++        if board.pieces[0][r] != 0 || board.pieces[1][r] != 0 {
++            return false;
++        }
++        if board.pieces[0][q] != 0 || board.pieces[1][q] != 0 {
++            return false;
++        }
++        let n = Piece::Knight as usize;
++        let b = Piece::Bishop as usize;
++        let white_minors = (board.pieces[0][n] | board.pieces[0][b]).count_ones();
++        let black_minors = (board.pieces[1][n] | board.pieces[1][b]).count_ones();
++        white_minors <= 1 && black_minors <= 1
++    }
++
++    #[inline]
++    fn piece_value(p: Piece) -> i32 {
++        match p {
++            Piece::Pawn => 100,
++            Piece::Knight => 320,
++            Piece::Bishop => 330,
++            Piece::Rook => 500,
++            Piece::Queen => 900,
++            Piece::King => 20000,
++        }
++    }
++
++    fn order_moves(&self, mut moves: Vec<Move>, tt_move: Option<Move>, ply: u8) -> Vec<Move> {
++        // Ход из TT передаётся снаружи: он уже прочитан для IIR, не читаем дважды
++        moves.sort_by_cached_key(|mv| {
++            // Приоритеты: TT > взятия (MVV-LVA) > превращения > киллеры > история
++            if let Some(tt_mv) = tt_move {
++                if tt_mv.from == mv.from && tt_mv.to == mv.to {
++                    return -10_000_000;
++                }
++            }
++
++            let mut score = 0;
++
++            if let Some(captured) = mv.captured {
++                score += 2_000_000 + Self::piece_value(captured) * 10 - Self::piece_value(mv.piece) / 10;
++            }
++
++            if mv.promotion.is_some() {
++                score += 1_900_000;
++            }
++
++            if mv.captured.is_none() {
++                if ply < MAX_DEPTH {
++                    for (i, killer) in self.killer_moves[ply as usize].iter().enumerate() {
++                        if let Some(k) = killer {
++                            if k.from == mv.from && k.to == mv.to {
++                                score += 1_000_000 - (i as i32) * 100_000;
++                                break;
++                            }
++                        }
++                    }
++                }
++
++                // История всегда меньше киллеров и взятий (ограничена HISTORY_LIMIT)
++                score += self.history_table[mv.from as usize][mv.to as usize].min(HISTORY_LIMIT);
++            }
++
++            -score
++        });
++
++        moves
++    }
++
++    fn store_killer_move(&mut self, mv: Move, ply: u8) {
++        if ply >= MAX_DEPTH {
++            return;
++        }
++
++        let killers = &mut self.killer_moves[ply as usize];
++
++        if let Some(first) = killers[0] {
++            if first.from != mv.from || first.to != mv.to {
++                killers[1] = Some(first);
++                killers[0] = Some(mv);
++            }
++        } else {
++            killers[0] = Some(mv);
++        }
++    }
++
++    /// Есть ли у стороны, которая ходит, хоть одна фигура кроме пешек и короля.
++    /// Если нет — null move опасен (цугцванг).
++    fn has_non_pawn_material(&self, board: &Board) -> bool {
++        let side = board.side_to_move as usize;
++        for piece in 1..5 {
++            if board.pieces[side][piece] != 0 {
++                return true;
++            }
++        }
++        false
++    }
++
++    fn format_pv_line(&self) -> String {
++        let mut pv = String::new();
++        for i in 0..self.pv_length[0] {
++            if let Some(mv) = self.pv_table[0][i] {
++                if !pv.is_empty() {
++                    pv.push(' ');
++                }
++                pv.push_str(&self.format_move(&mv));
++            }
++        }
++        pv
++    }
++
++    fn format_move(&self, mv: &Move) -> String {
++        let from = Self::square_to_algebraic(mv.from);
++        let to = Self::square_to_algebraic(mv.to);
++
++        if let Some(promo) = mv.promotion {
++            let promo_char = match promo {
++                Piece::Queen => 'q',
++                Piece::Rook => 'r',
++                Piece::Bishop => 'b',
++                Piece::Knight => 'n',
++                _ => 'q',
++            };
++            format!("{}{}{}", from, to, promo_char)
++        } else {
++            format!("{}{}", from, to)
++        }
++    }
++
++    fn square_to_algebraic(square: u8) -> String {
++        let file = (b'a' + (square % 8)) as char;
++        let rank = (b'1' + (square / 8)) as char;
++        format!("{}{}", file, rank)
++    }
++
++    pub fn clear_tt(&mut self) {
++        self.tt.clear();
++        self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
++        self.history_table = [[0; 64]; 64];
++    }
++}
++
++impl Default for Search {
++    fn default() -> Self {
++        Self::new()
++    }
++}
+diff --git a/src/see.rs b/src/see.rs
+index e7c3dce..f8b40d8 100755
+--- a/src/see.rs
++++ b/src/see.rs
+@@ -1,7 +1,22 @@
+ // Static Exchange Evaluation (SEE)
+-// Evaluates the outcome of a capture sequence
+-
+-use crate::board::{Board, Piece, Color, Bitboard};
++// Evaluates the material outcome of a capture sequence on a single square.
++//
++// КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: старая версия содержала две ошибки в swap-алгоритме:
++//   1) условие досрочного выхода `gain[d-1] > -gain[d]` было тождественно
++//      истинным на первом шаге (эквивалентно `V[attacker] > 0`), поэтому цикл
++//      ВСЕГДА завершался после первого шага;
++//   2) минимаксная свёртка применялась на один шаг больше, чем нужно.
++// В результате SEE всегда возвращало `цена_жертвы - цена_нападающего`,
++// т.е. RxP считалось проигрышным (-400), QxR — проигрышным и т.д. Движок
++// массово отказывался от выгодных взятий в qsearch и на малых глубинах.
++//
++// Новая реализация — честный negamax-обмен:
++//   W(d) = max(0, VALUE[фигуры_на_to_перед_ходом_d] - W(d+1)),  W(за_последним) = 0
++//   SEE  = VALUE[жертвы] - W(1)
++// Она доказуемо корректна и дополнительно корректно обрабатывает en passant
++// (жертва — пешка, хотя поле `to` пусто).
++
++use crate::board::{Board, Piece, Color, Bitboard, Move};
+ 
+ pub struct SEE;
+ 
+@@ -16,83 +31,63 @@ impl SEE {
+         10000, // King
+     ];
+ 
+-    /// Static Exchange Evaluation
+-    /// Returns the material gain/loss from a capture sequence
+-    pub fn evaluate(board: &Board, from: u8, to: u8, piece: Piece) -> i32 {
+-        let mut gain = vec![0i32];
+-        let mut color = board.side_to_move;
+-
+-        // Get the value of the captured piece (if any)
+-        if let Some(captured) = Self::get_piece_at(board, to) {
+-            gain[0] = Self::PIECE_VALUES[captured as usize];
+-        } else {
+-            return 0; // No capture
+-        }
++    /// Static Exchange Evaluation хода-взятия `mv`.
++    /// Возвращает материальный итог обмена с точки зрения делающего ход.
++    pub fn evaluate(board: &Board, mv: &Move) -> i32 {
++        let Some(captured) = mv.captured else {
++            return 0; // не взятие — SEE неприменим
++        };
+ 
+-        let mut attackers = Self::get_all_attackers(board, to);
+-        let mut occupied = board.all_occupied ^ (1u64 << from);
+-        let mut attacker_piece = piece;
++        let victim_value = Self::PIECE_VALUES[captured as usize];
+ 
+-        loop {
+-            color = color.opposite();
++        let mut gain = [0i32; 32];
++        gain[0] = victim_value;
++        let mut d = 0usize;
+ 
+-            // Add the value of the piece that just captured
+-            let last_gain = *gain.last().unwrap();
+-            gain.push(Self::PIECE_VALUES[attacker_piece as usize] - last_gain);
+-
+-            // Stop if the defending side gains material
+-            if gain.iter().rev().nth(1).unwrap() > &(-gain.last().unwrap()) {
+-                break;
+-            }
++        // Фигура, стоящая на `to` после нашего взятия (следующий взявший её получит её цену)
++        let mut attacker_piece = mv.piece;
++        // Клетка, с которой уходит атакующий, освобождается для рентгеновских атакеров
++        let mut occupied = board.all_occupied ^ (1u64 << mv.from);
++        let mut attackers = Self::get_all_attackers(board, mv.to);
++        // Кто отвечает на взятие: сначала соперник
++        let mut side = board.side_to_move.opposite();
+ 
+-            // Find the least valuable attacker for the current side
++        loop {
+             attackers &= occupied;
+-            let next_attacker = Self::get_least_valuable_attacker(board, attackers, to, color);
++            let Some((sq, piece_type)) = Self::get_least_valuable_attacker(board, attackers, side)
++            else {
++                break; // у стороны `side` больше нет взятий на `to`
++            };
+ 
+-            if let Some((sq, piece_type)) = next_attacker {
+-                attacker_piece = piece_type;
+-                occupied ^= 1u64 << sq;
++            d += 1;
++            // Сторона `side` забирает фигуру, стоящую на `to`
++            gain[d] = Self::PIECE_VALUES[attacker_piece as usize];
+ 
+-                // Add discovered attacks
+-                if piece_type == Piece::Pawn || piece_type == Piece::Bishop || piece_type == Piece::Queen {
+-                    attackers |= Self::get_bishop_xray_attackers(board, to, occupied);
+-                }
+-                if piece_type == Piece::Rook || piece_type == Piece::Queen {
+-                    attackers |= Self::get_rook_xray_attackers(board, to, occupied);
+-                }
+-            } else {
+-                break;
++            attacker_piece = piece_type;
++            occupied ^= 1u64 << sq;
++
++            // Вскрываем рентгеновских атакеров за освободившейся клеткой
++            if matches!(piece_type, Piece::Pawn | Piece::Bishop | Piece::Queen) {
++                attackers |= Self::get_bishop_xray_attackers(board, mv.to, occupied);
++            }
++            if matches!(piece_type, Piece::Rook | Piece::Queen) {
++                attackers |= Self::get_rook_xray_attackers(board, mv.to, occupied);
+             }
+-        }
+ 
+-        // Minimax through the gain list
+-        while gain.len() > 1 {
+-            let last = gain.pop().unwrap();
+-            let prev = gain.last_mut().unwrap();
+-            *prev = -(-*prev).max(last);
++            side = side.opposite();
++            if d >= 31 {
++                break; // страховка: реальные обмены короче
++            }
+         }
+ 
+-        gain[0]
+-    }
+-
+-    fn get_piece_at(board: &Board, square: u8) -> Option<Piece> {
+-        let sq_bb = 1u64 << square;
+-        for color in 0..2 {
+-            for (i, &piece_bb) in board.pieces[color].iter().enumerate() {
+-                if (piece_bb & sq_bb) != 0 {
+-                    return Some(match i {
+-                        0 => Piece::Pawn,
+-                        1 => Piece::Knight,
+-                        2 => Piece::Bishop,
+-                        3 => Piece::Rook,
+-                        4 => Piece::Queen,
+-                        5 => Piece::King,
+-                        _ => unreachable!(),
+-                    });
+-                }
+-            }
++        // Свёртка negamax'ом: W = max(0, gain[d] - W), SEE = gain[0] - W
++        let mut w = 0i32;
++        while d > 0 {
++            w = (gain[d] - w).max(0);
++            d -= 1;
+         }
+-        None
++
++        gain[0] - w
+     }
+ 
+     fn get_all_attackers(board: &Board, square: u8) -> Bitboard {
+@@ -102,15 +97,16 @@ impl SEE {
+         let sq = square as usize;
+         let mut attackers = 0u64;
+ 
+-        // Pawn attackers
+-        for color in 0..2 {
+-            let pawn_attacks = if color == 0 {
+-                Self::pawn_attacks_white(square)
+-            } else {
+-                Self::pawn_attacks_black(square)
+-            };
+-            attackers |= pawn_attacks & board.pieces[color][Piece::Pawn as usize];
+-        }
++        // Pawn attackers.
++        // ВНИМАНИЕ (исправленный баг оригинала): раньше маски были перепутаны —
++        // белые атакеры искались СВЕРХУ поля, чёрные — СНИЗУ, и пешечная защита
++        // в SEE никогда не учитывалась.
++        // Белая пешка бьёт вверх: атакеры поля S стоят на S-7/S-9.
++        let white_pawn_from = Self::pawn_attacks_black(square);
++        attackers |= white_pawn_from & board.pieces[0][Piece::Pawn as usize];
++        // Чёрная пешка бьёт вниз: атакеры поля S стоят на S+7/S+9.
++        let black_pawn_from = Self::pawn_attacks_white(square);
++        attackers |= black_pawn_from & board.pieces[1][Piece::Pawn as usize];
+ 
+         // Knight attackers
+         let knight_attacks = Self::knight_attacks(square);
+@@ -137,7 +133,7 @@ impl SEE {
+         attackers
+     }
+ 
+-    fn get_least_valuable_attacker(board: &Board, mut attackers: Bitboard, _square: u8, color: Color) -> Option<(u8, Piece)> {
++    fn get_least_valuable_attacker(board: &Board, attackers: Bitboard, color: Color) -> Option<(u8, Piece)> {
+         let color_idx = color as usize;
+         let my_attackers = attackers & board.occupied[color_idx];
+ 
+@@ -245,3 +241,88 @@ impl SEE {
+         attacks
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::movegen::MoveGenerator;
++
++    /// Находит легальный ход from->to и заполняет его поля (piece/captured/флаги)
++    fn find_move(board: &Board, from: u8, to: u8) -> Move {
++        *MoveGenerator::get()
++            .generate_moves(board)
++            .iter()
++            .find(|m| m.from == from && m.to == to)
++            .expect("ход должен быть легальным")
++    }
++
++    #[test]
++    fn rook_takes_undefended_pawn() {
++        let b = Board::from_fen("4k3/8/8/8/8/8/3p4/3R4 w - - 0 1");
++        let mv = find_move(&b, 3, 11); // Rd1xd2
++        assert_eq!(mv.captured, Some(Piece::Pawn));
++        assert_eq!(SEE::evaluate(&b, &mv), 100, "RxP без защиты = +100");
++    }
++
++    #[test]
++    fn rook_takes_defended_pawn() {
++        // Король белых убран на h1, чтобы не защищал d2: обмен Rxd2 c3xd2 = -400
++        let b = Board::from_fen("4k3/8/8/8/8/2p5/3p4/3R3K w - - 0 1");
++        let mv = find_move(&b, 3, 11); // Rd1xd2, пешку защищает c3
++        assert_eq!(mv.captured, Some(Piece::Pawn));
++        assert_eq!(SEE::evaluate(&b, &mv), -400, "RxP с защитой = -400");
++    }
++
++    #[test]
++    fn pawn_takes_defended_queen() {
++        let b = Board::from_fen("4k3/8/2p5/3q4/4P3/8/8/4K3 w - - 0 1");
++        let mv = find_move(&b, 28, 35); // Pe4xd5, ферзя защищает пешка c6
++        assert_eq!(mv.captured, Some(Piece::Queen));
++        assert_eq!(SEE::evaluate(&b, &mv), 800, "PxQ с защитой = +800");
++    }
++
++    #[test]
++    fn knight_equal_trade() {
++        // Nd2xe4 — конь забирает коня, того забирает пешка d5: размен = 0
++        let b = Board::from_fen("4k3/8/8/3p4/4n3/8/3N4/4K3 w - - 0 1");
++        let mv = find_move(&b, 11, 28); // Nd2xe4 (e4 = 28)
++        assert_eq!(mv.captured, Some(Piece::Knight));
++        assert_eq!(SEE::evaluate(&b, &mv), 0, "NxN размен = 0");
++    }
++
++    #[test]
++    fn xray_behind_captured_piece() {
++        // Rg2xa2: пешку защищает Ra8, но за ним на h2 — вторая ладья:
++        // P(+100) x R(-500) x R(+500) = +100
++        let b = Board::from_fen("r3k3/8/8/8/8/8/p5RR/7K w - - 0 1");
++        let mv = find_move(&b, 14, 8); // Rg2xa2
++        assert_eq!(mv.captured, Some(Piece::Pawn));
++        assert_eq!(SEE::evaluate(&b, &mv), 100, "рентген за взятой пешкой");
++    }
++
++    #[test]
++    fn king_capture_refused() {
++        // Kxd2 — пешку защищают две пешки c3/e3: король забирать не должен.
++        // Такой ход нелегален, поэтому задаём его вручную (SEE в поиске
++        // вызывается и на псевдолегальных гипотезах обмена).
++        let b = Board::from_fen("4k3/8/8/8/8/2p1p3/8/3K4 w - - 0 1");
++        let mv = Move {
++            from: 3,
++            to: 11,
++            piece: Piece::King,
++            captured: Some(Piece::Pawn),
++            promotion: None,
++            is_castle: false,
++            is_en_passant: false,
++        };
++        assert_eq!(SEE::evaluate(&b, &mv), -9900, "взятие королём под ударом крайне проигрышно");
++    }
++
++    #[test]
++    fn queen_takes_hanging_rook() {
++        let b = Board::from_fen("4k3/8/8/3r4/8/8/8/3QK3 w - - 0 1");
++        let mv = find_move(&b, 3, 35); // Qd1xd5
++        assert_eq!(mv.captured, Some(Piece::Rook));
++        assert_eq!(SEE::evaluate(&b, &mv), 500, "QxR без защиты = +500");
++    }
++}
+diff --git a/src/transposition.rs b/src/transposition.rs
+index 6d588df..341009e 100755
+--- a/src/transposition.rs
++++ b/src/transposition.rs
+@@ -40,18 +40,28 @@ impl Default for TTEntry {
+ pub struct TranspositionTable {
+     entries: Vec<TTEntry>,
+     size: usize,
++    mask: usize, // size всегда степень двойки — индекс по AND вместо дорогого деления
+     current_age: u8,
++    used: usize, // занятые слоты (для hashfull без полного прохода по таблице)
+     hits: u64,
+     misses: u64,
+ }
+ 
+ impl TranspositionTable {
+     pub fn new(size_mb: usize) -> Self {
+-        let size = (size_mb * 1024 * 1024) / BYTES_PER_ENTRY;
++        let wanted = (size_mb.max(1) * 1024 * 1024) / BYTES_PER_ENTRY;
++        // Округляем вниз до степени двойки: индексация по AND вместо деления
++        let mut size = wanted.next_power_of_two();
++        if size > wanted {
++            size >>= 1;
++        }
++        let size = size.max(1);
+         Self {
+             entries: vec![TTEntry::default(); size],
+             size,
++            mask: size - 1,
+             current_age: 0,
++            used: 0,
+             hits: 0,
+             misses: 0,
+         }
+@@ -62,7 +72,7 @@ impl TranspositionTable {
+     }
+ 
+     fn index(&self, hash: ZobristHash) -> usize {
+-        (hash as usize) % self.size
++        (hash as usize) & self.mask
+     }
+ 
+     pub fn probe(&mut self, hash: ZobristHash, depth: u8, alpha: i32, beta: i32) -> Option<i32> {
+@@ -76,12 +86,14 @@ impl TranspositionTable {
+                 NodeType::Exact => return Some(entry.score),
+                 NodeType::LowerBound => {
+                     if entry.score >= beta {
+-                        return Some(beta);
++                        // Возвращаем сохранённый счёт (а не beta): так сохраняется
++                        // матовая дистанция, закодированная при записи
++                        return Some(entry.score);
+                     }
+                 }
+                 NodeType::UpperBound => {
+                     if entry.score <= alpha {
+-                        return Some(alpha);
++                        return Some(entry.score);
+                     }
+                 }
+             }
+@@ -107,6 +119,9 @@ impl TranspositionTable {
+             || depth >= entry.depth;
+ 
+         if should_replace {
++            if entry.hash == 0 {
++                self.used += 1;
++            }
+             *entry = TTEntry {
+                 hash,
+                 depth,
+@@ -133,6 +148,7 @@ impl TranspositionTable {
+         for entry in &mut self.entries {
+             *entry = TTEntry::default();
+         }
++        self.used = 0;
+         self.hits = 0;
+         self.misses = 0;
+     }
+@@ -150,9 +166,9 @@ impl TranspositionTable {
+         }
+     }
+ 
++    /// Заполненность таблицы в процентах (0-100). O(1) — счётчик поддерживается при записи.
+     pub fn usage(&self) -> f64 {
+-        let used = self.entries.iter().filter(|e| e.hash != 0).count();
+-        (used as f64) / (self.size as f64) * 100.0
++        (self.used as f64) / (self.size as f64) * 100.0
+     }
+ 
+     #[allow(dead_code)]
+diff --git a/src/uci.rs b/src/uci.rs
+index 7f9f09b..65a4bb2 100755
+--- a/src/uci.rs
++++ b/src/uci.rs
+@@ -6,13 +6,18 @@ use std::time::Duration;
+ pub struct UciEngine {
+     board: Board,
+     search: Search,
++    /// Хэши всех позиций текущей партии (включая корень) — для детекции повторений
++    history: Vec<u64>,
+ }
+ 
+ impl UciEngine {
+     pub fn new() -> Self {
++        let board = Board::new();
++        let history = vec![board.hash];
+         Self {
+-            board: Board::new(),
++            board,
+             search: Search::new(),
++            history,
+         }
+     }
+ 
+@@ -37,6 +42,10 @@ impl UciEngine {
+                 "ucinewgame" => self.new_game(),
+                 "position" => self.position(&parts[1..]),
+                 "go" => self.go(&parts[1..]),
++                "setoption" => self.setoption(&parts[1..]),
++                // Поиск синхронный и ограничен лимитом времени, поэтому "stop"
++                // вне поиска валиден только как no-op (спека UCI шлёт его лишь во время go)
++                "stop" => {}
+                 "quit" => break,
+                 "d" | "display" => self.display(),
+                 "clear" => self.clear_tt(),
+@@ -46,17 +55,55 @@ impl UciEngine {
+     }
+ 
+     fn uci(&self) {
+-        println!("id name Noksiy 0.5.0");
++        println!("id name Noksiy 0.6.0");
+         println!("id author nesstyx & Claude (AI-generated)");
+         println!("option name Hash type spin default 128 min 1 max 1024");
++        println!("option name Clear Hash type button");
+         println!("uciok");
+     }
+ 
+     fn new_game(&mut self) {
+         self.board = Board::new();
++        self.history.clear();
++        self.history.push(self.board.hash);
+         self.search.clear_tt();
+     }
+ 
++    /// setoption name <имя> [value <значение>]
++    fn setoption(&mut self, args: &[&str]) {
++        if args.len() < 2 || args[0] != "name" {
++            return;
++        }
++        let mut i = 1;
++        let mut name = String::new();
++        while i < args.len() && args[i] != "value" {
++            if !name.is_empty() {
++                name.push(' ');
++            }
++            name.push_str(args[i]);
++            i += 1;
++        }
++        let value = if i < args.len() && args[i] == "value" {
++            args[i + 1..].join(" ")
++        } else {
++            String::new()
++        };
++
++        match name.as_str() {
++            "Hash" => {
++                if let Ok(mb) = value.trim().parse::<usize>() {
++                    let mb = mb.clamp(1, 1024);
++                    self.search.set_hash_size(mb);
++                    println!("info string Hash set to {} MB", mb);
++                }
++            }
++            "Clear Hash" => {
++                self.search.clear_tt();
++            }
++            _ => {}
++        }
++    }
++
+     fn clear_tt(&mut self) {
+         self.search.clear_tt();
+         println!("info string Transposition table cleared");
+@@ -70,6 +117,8 @@ impl UciEngine {
+         match args[0] {
+             "startpos" => {
+                 self.board = Board::new();
++                self.history.clear();
++                self.history.push(self.board.hash);
+ 
+                 // Check for moves after startpos
+                 if args.len() > 1 && args[1] == "moves" {
+@@ -88,6 +137,8 @@ impl UciEngine {
+ 
+                 let fen = fen_parts.join(" ");
+                 self.board = Board::from_fen(&fen);
++                self.history.clear();
++                self.history.push(self.board.hash);
+ 
+                 // Apply moves if present
+                 if i < args.len() && args[i] == "moves" {
+@@ -99,7 +150,7 @@ impl UciEngine {
+     }
+ 
+     fn apply_moves(&mut self, move_strs: &[&str]) {
+-        let movegen = crate::movegen::MoveGenerator::new();
++        let movegen = crate::movegen::MoveGenerator::get();
+ 
+         for move_str in move_strs {
+             let legal_moves = movegen.generate_moves(&self.board);
+@@ -107,6 +158,8 @@ impl UciEngine {
+             // Parse move in UCI format (e2e4, e7e8q, etc.)
+             if let Some(mv) = self.parse_uci_move(move_str, &legal_moves) {
+                 self.board.make_move(mv);
++                // Запоминаем позицию для детекции повторений
++                self.history.push(self.board.hash);
+             }
+         }
+     }
+@@ -165,6 +218,7 @@ impl UciEngine {
+         let mut depth: u8 = 64;
+         let mut time_limit = None;
+         let (mut wtime, mut btime, mut winc, mut binc) = (None, None, 0u64, 0u64);
++        let mut movestogo: Option<u64> = None;
+         let mut has_depth = false;
+ 
+         let mut i = 0;
+@@ -186,7 +240,9 @@ impl UciEngine {
+                 "btime" => { btime = val; i += 2; }
+                 "winc" => { winc = val.unwrap_or(0); i += 2; }
+                 "binc" => { binc = val.unwrap_or(0); i += 2; }
+-                "infinite" => { depth = 63; i += 1; }
++                "movestogo" => { movestogo = val; i += 2; }
++                // go ponder / go infinite: поиск до исчерпания глубины/времени
++                "ponder" | "infinite" => { if args[i] == "infinite" { depth = 63; } i += 1; }
+                 _ => i += 1,
+             }
+         }
+@@ -199,14 +255,19 @@ impl UciEngine {
+                 (btime, binc)
+             };
+             if let Some(t) = t {
+-                let alloc = (t / 30 + inc / 2).min(t.saturating_sub(100)).max(10);
++                // Базовый расход: t/30, при явном movestogo — t/movestogo, плюс половина инкремента
++                let base = match movestogo {
++                    Some(mtg) if mtg > 0 => t / mtg,
++                    _ => t / 30,
++                };
++                let alloc = (base + inc / 2).min(t.saturating_sub(100)).max(10);
+                 time_limit = Some(Duration::from_millis(alloc));
+             } else if !has_depth {
+                 depth = 8;
+             }
+         }
+ 
+-        if let Some(best_move) = self.search.find_best_move(&self.board, depth.min(63), time_limit) {
++        if let Some(best_move) = self.search.find_best_move(&self.board, depth.min(63), time_limit, &self.history) {
+             println!("bestmove {}", self.format_move(&best_move));
+         } else {
+             println!("bestmove 0000");
+diff --git a/src/zobrist.rs b/src/zobrist.rs
+index 0230fbe..68e35e1 100755
+--- a/src/zobrist.rs
++++ b/src/zobrist.rs
+@@ -1,7 +1,12 @@
+ // Zobrist hashing for transposition table
+ // Uses precomputed random numbers to create unique position hashes
++//
++// Хэш теперь поддерживается ИНКРЕМЕНТАЛЬНО в Board::make_move (поле Board::hash),
++// поэтому поиск больше не пересчитывает его с нуля в каждом узле — это заметный
++// прирост NPS. Полный пересчёт Zobrist::hash() остаётся эталоном и используется
++// в тестах (свойство: incremental == recompute после каждого хода).
+ 
+-use crate::board::{Board, Color, Piece};
++use crate::board::{Board, Color};
+ use std::sync::OnceLock;
+ 
+ pub type ZobristHash = u64;
+@@ -18,9 +23,9 @@ static ZOBRIST_KEYS: OnceLock<ZobristKeys> = OnceLock::new();
+ 
+ impl ZobristKeys {
+     fn new() -> Self {
+-        // Generate pseudo-random numbers using a simple PRNG
+-        // In production, these should be truly random and precomputed
+-        let mut rng = SimplePRNG::new(0x1234567890ABCDEF);
++        // SplitMix64 — детерминированный и с хорошим перемешиванием бит:
++        // для Zobrist-ключей это снижает вероятность ложных коллизий.
++        let mut rng = SimplePRNG::new(0x1234_5678_90AB_CDEF);
+ 
+         let mut keys = ZobristKeys {
+             pieces: [[[0; 64]; 6]; 2],
+@@ -57,6 +62,28 @@ impl ZobristKeys {
+     pub fn get() -> &'static ZobristKeys {
+         ZOBRIST_KEYS.get_or_init(ZobristKeys::new)
+     }
++
++    // --- Доступ к ключам для инкрементального обновления хэша ---
++
++    #[inline]
++    pub fn piece_key(&self, color: usize, piece: usize, square: usize) -> ZobristHash {
++        self.pieces[color][piece][square]
++    }
++
++    #[inline]
++    pub fn castling_key(&self, rights: u8) -> ZobristHash {
++        self.castling[rights as usize]
++    }
++
++    #[inline]
++    pub fn en_passant_key(&self, file: usize) -> ZobristHash {
++        self.en_passant[file]
++    }
++
++    #[inline]
++    pub fn side_key(&self) -> ZobristHash {
++        self.side_to_move
++    }
+ }
+ 
+ // Simple pseudo-random number generator for Zobrist keys
+@@ -70,11 +97,12 @@ impl SimplePRNG {
+     }
+ 
+     fn next(&mut self) -> u64 {
+-        // Xorshift64 algorithm
+-        self.state ^= self.state << 13;
+-        self.state ^= self.state >> 7;
+-        self.state ^= self.state << 17;
+-        self.state
++        // SplitMix64
++        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
++        let mut z = self.state;
++        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
++        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
++        z ^ (z >> 31)
+     }
+ }
+ 
+@@ -82,6 +110,9 @@ impl SimplePRNG {
+ pub struct Zobrist;
+ 
+ impl Zobrist {
++    /// Полный пересчёт хэша позиции (эталон для тестов, используется при постановке FEN).
++    /// Клетка en passant хэшируется только если она реально установлена
++    /// (Board нормализует её: Some <=> есть пешка, которая может взять на проходе).
+     pub fn hash(board: &Board) -> ZobristHash {
+         let keys = ZobristKeys::get();
+         let mut hash = 0u64;
+@@ -115,38 +146,15 @@ impl Zobrist {
+         hash
+     }
+ 
+-    // Update hash incrementally after a move (faster than recomputing)
+-    pub fn update_hash(
+-        hash: ZobristHash,
+-        from: u8,
+-        to: u8,
+-        piece: Piece,
+-        color: Color,
+-        captured: Option<Piece>,
+-    ) -> ZobristHash {
++    /// Хэш позиции после null-move (пропуск хода): меняется только сторона
++    /// и сбрасывается клетка en passant. Фигуры не трогаются.
++    pub fn null_move_hash(board: &Board) -> ZobristHash {
+         let keys = ZobristKeys::get();
+-        let mut new_hash = hash;
+-
+-        let color_idx = color as usize;
+-        let piece_idx = piece as usize;
+-
+-        // Remove piece from source square
+-        new_hash ^= keys.pieces[color_idx][piece_idx][from as usize];
+-
+-        // Add piece to destination square
+-        new_hash ^= keys.pieces[color_idx][piece_idx][to as usize];
+-
+-        // Handle capture
+-        if let Some(captured_piece) = captured {
+-            let opp_color = color.opposite() as usize;
+-            let captured_idx = captured_piece as usize;
+-            new_hash ^= keys.pieces[opp_color][captured_idx][to as usize];
++        let mut hash = board.hash ^ keys.side_key();
++        if let Some(ep_square) = board.en_passant_square {
++            hash ^= keys.en_passant_key((ep_square % 8) as usize);
+         }
+-
+-        // Toggle side to move
+-        new_hash ^= keys.side_to_move;
+-
+-        new_hash
++        hash
+     }
+ }
+ 
+@@ -173,4 +181,18 @@ mod tests {
+ 
+         assert_eq!(hash1, hash2, "Same position should always hash to same value");
+     }
++
++    #[test]
++    fn test_null_move_hash_toggles_side() {
++        let board = Board::new();
++        let h0 = Zobrist::hash(&board);
++        let h1 = Zobrist::null_move_hash(&board);
++        assert_ne!(h0, h1);
++        // Двойной null возвращает исходный хэш
++        let mut board2 = board;
++        board2.side_to_move = board2.side_to_move.opposite();
++        board2.hash = h1;
++        let h2 = Zobrist::null_move_hash(&board2);
++        assert_eq!(h0, h2);
++    }
+ }

@@ -1,5 +1,6 @@
 use crate::board::{Board, Bitboard, Piece, Color, Move};
 use crate::magic::MagicBitboards;
+use std::sync::OnceLock;
 
 // Precalculated attack tables for fast move generation
 pub struct MoveGenerator {
@@ -8,7 +9,15 @@ pub struct MoveGenerator {
     pawn_attacks: [[Bitboard; 64]; 2], // [color][square]
 }
 
+static SHARED_MOVEGEN: OnceLock<MoveGenerator> = OnceLock::new();
+
 impl MoveGenerator {
+    /// Общий статический экземпляр: таблицы атак неизменяемы, поэтому их
+    /// безопасно переиспользовать (eval, gives_check, UCI).
+    pub fn get() -> &'static MoveGenerator {
+        SHARED_MOVEGEN.get_or_init(MoveGenerator::new)
+    }
+
     pub fn new() -> Self {
         let mut gen = MoveGenerator {
             knight_attacks: [0; 64],
@@ -26,6 +35,16 @@ impl MoveGenerator {
             self.pawn_attacks[0][sq] = Self::generate_pawn_attacks(sq, Color::White);
             self.pawn_attacks[1][sq] = Self::generate_pawn_attacks(sq, Color::Black);
         }
+    }
+
+    #[inline]
+    pub fn knight_attacks_at(&self, square: usize) -> Bitboard {
+        self.knight_attacks[square]
+    }
+
+    #[inline]
+    pub fn pawn_attacks_at(&self, color: usize, square: usize) -> Bitboard {
+        self.pawn_attacks[color][square]
     }
 
     fn generate_knight_attacks(square: usize) -> Bitboard {

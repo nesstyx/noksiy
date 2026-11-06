@@ -6,13 +6,18 @@ use std::time::Duration;
 pub struct UciEngine {
     board: Board,
     search: Search,
+    /// Хэши всех позиций текущей партии (включая корень) — для детекции повторений
+    history: Vec<u64>,
 }
 
 impl UciEngine {
     pub fn new() -> Self {
+        let board = Board::new();
+        let history = vec![board.hash];
         Self {
-            board: Board::new(),
+            board,
             search: Search::new(),
+            history,
         }
     }
 
@@ -37,6 +42,10 @@ impl UciEngine {
                 "ucinewgame" => self.new_game(),
                 "position" => self.position(&parts[1..]),
                 "go" => self.go(&parts[1..]),
+                "setoption" => self.setoption(&parts[1..]),
+                // Поиск синхронный и ограничен лимитом времени, поэтому "stop"
+                // вне поиска валиден только как no-op (спека UCI шлёт его лишь во время go)
+                "stop" => {}
                 "quit" => break,
                 "d" | "display" => self.display(),
                 "clear" => self.clear_tt(),
@@ -46,15 +55,53 @@ impl UciEngine {
     }
 
     fn uci(&self) {
-        println!("id name Noksiy 0.5.0");
+        println!("id name Noksiy 0.6.0");
         println!("id author nesstyx & Claude (AI-generated)");
         println!("option name Hash type spin default 128 min 1 max 1024");
+        println!("option name Clear Hash type button");
         println!("uciok");
     }
 
     fn new_game(&mut self) {
         self.board = Board::new();
+        self.history.clear();
+        self.history.push(self.board.hash);
         self.search.clear_tt();
+    }
+
+    /// setoption name <имя> [value <значение>]
+    fn setoption(&mut self, args: &[&str]) {
+        if args.len() < 2 || args[0] != "name" {
+            return;
+        }
+        let mut i = 1;
+        let mut name = String::new();
+        while i < args.len() && args[i] != "value" {
+            if !name.is_empty() {
+                name.push(' ');
+            }
+            name.push_str(args[i]);
+            i += 1;
+        }
+        let value = if i < args.len() && args[i] == "value" {
+            args[i + 1..].join(" ")
+        } else {
+            String::new()
+        };
+
+        match name.as_str() {
+            "Hash" => {
+                if let Ok(mb) = value.trim().parse::<usize>() {
+                    let mb = mb.clamp(1, 1024);
+                    self.search.set_hash_size(mb);
+                    println!("info string Hash set to {} MB", mb);
+                }
+            }
+            "Clear Hash" => {
+                self.search.clear_tt();
+            }
+            _ => {}
+        }
     }
 
     fn clear_tt(&mut self) {
@@ -70,6 +117,8 @@ impl UciEngine {
         match args[0] {
             "startpos" => {
                 self.board = Board::new();
+                self.history.clear();
+                self.history.push(self.board.hash);
 
                 // Check for moves after startpos
                 if args.len() > 1 && args[1] == "moves" {
@@ -88,6 +137,8 @@ impl UciEngine {
 
                 let fen = fen_parts.join(" ");
                 self.board = Board::from_fen(&fen);
+                self.history.clear();
+                self.history.push(self.board.hash);
 
                 // Apply moves if present
                 if i < args.len() && args[i] == "moves" {
@@ -99,7 +150,7 @@ impl UciEngine {
     }
 
     fn apply_moves(&mut self, move_strs: &[&str]) {
-        let movegen = crate::movegen::MoveGenerator::new();
+        let movegen = crate::movegen::MoveGenerator::get();
 
         for move_str in move_strs {
             let legal_moves = movegen.generate_moves(&self.board);
@@ -107,6 +158,8 @@ impl UciEngine {
             // Parse move in UCI format (e2e4, e7e8q, etc.)
             if let Some(mv) = self.parse_uci_move(move_str, &legal_moves) {
                 self.board.make_move(mv);
+                // Запоминаем позицию для детекции повторений
+                self.history.push(self.board.hash);
             }
         }
     }
@@ -165,6 +218,7 @@ impl UciEngine {
         let mut depth: u8 = 64;
         let mut time_limit = None;
         let (mut wtime, mut btime, mut winc, mut binc) = (None, None, 0u64, 0u64);
+        let mut movestogo: Option<u64> = None;
         let mut has_depth = false;
 
         let mut i = 0;
@@ -186,7 +240,9 @@ impl UciEngine {
                 "btime" => { btime = val; i += 2; }
                 "winc" => { winc = val.unwrap_or(0); i += 2; }
                 "binc" => { binc = val.unwrap_or(0); i += 2; }
-                "infinite" => { depth = 63; i += 1; }
+                "movestogo" => { movestogo = val; i += 2; }
+                // go ponder / go infinite: поиск до исчерпания глубины/времени
+                "ponder" | "infinite" => { if args[i] == "infinite" { depth = 63; } i += 1; }
                 _ => i += 1,
             }
         }
@@ -199,14 +255,19 @@ impl UciEngine {
                 (btime, binc)
             };
             if let Some(t) = t {
-                let alloc = (t / 30 + inc / 2).min(t.saturating_sub(100)).max(10);
+                // Базовый расход: t/30, при явном movestogo — t/movestogo, плюс половина инкремента
+                let base = match movestogo {
+                    Some(mtg) if mtg > 0 => t / mtg,
+                    _ => t / 30,
+                };
+                let alloc = (base + inc / 2).min(t.saturating_sub(100)).max(10);
                 time_limit = Some(Duration::from_millis(alloc));
             } else if !has_depth {
                 depth = 8;
             }
         }
 
-        if let Some(best_move) = self.search.find_best_move(&self.board, depth.min(63), time_limit) {
+        if let Some(best_move) = self.search.find_best_move(&self.board, depth.min(63), time_limit, &self.history) {
             println!("bestmove {}", self.format_move(&best_move));
         } else {
             println!("bestmove 0000");
