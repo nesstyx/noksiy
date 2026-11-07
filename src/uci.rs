@@ -55,7 +55,7 @@ impl UciEngine {
     }
 
     fn uci(&self) {
-        println!("id name Noksiy 0.6.0");
+        println!("id name Noksiy 1.0.0");
         println!("id author nesstyx & Claude (AI-generated)");
         println!("option name Hash type spin default 128 min 1 max 1024");
         println!("option name Clear Hash type button");
@@ -255,12 +255,18 @@ impl UciEngine {
                 (btime, binc)
             };
             if let Some(t) = t {
-                // Базовый расход: t/30, при явном movestogo — t/movestogo, плюс половина инкремента
+                // Тайм-менеджмент v1.0: база t/20 (агрессивнее старого t/30),
+                // плюс 3/4 инкремента и запас на накладные расходы (overhead).
+                // Итоговый расход умножается на порог стабильности в поиске
+                // (45–80%): устойчивый ход — экономим, скачущий — не бросаем.
                 let base = match movestogo {
-                    Some(mtg) if mtg > 0 => t / mtg,
-                    _ => t / 30,
+                    Some(mtg) if mtg > 0 => t / mtg.max(1),
+                    _ => t / 20,
                 };
-                let alloc = (base + inc / 2).min(t.saturating_sub(100)).max(10);
+                let overhead = 50.max(t / 100) as u64;
+                let alloc = (base + inc * 3 / 4)
+                    .min(t.saturating_sub(overhead).max(1))
+                    .max(10);
                 time_limit = Some(Duration::from_millis(alloc));
             } else if !has_depth {
                 depth = 8;

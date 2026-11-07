@@ -36,6 +36,18 @@ const HISTORY_LIMIT: i32 = 400_000;
 // Late Move Pruning: сколько тихих ходов ищем полностью на глубинах 1..=3
 const LMP_LIMIT: [usize; 4] = [0, 6, 10, 15];
 
+// ProbCut: усечённый поиск «выгодных» взятий вместо полного дерева
+const PROBCUT_MIN_DEPTH: u8 = 5;
+const PROBCUT_BETA_MARGIN: i32 = 175;
+const PROBCUT_MAX_MOVES: usize = 3;
+
+// Контрход в сортировке: сразу после киллеров, выше истории
+const COUNTERMOVE_SCORE: i32 = 800_000;
+
+// Пороги истории для корректировки LMR
+const LMR_HISTORY_GOOD: i32 = 5_000;
+const LMR_HISTORY_BAD: i32 = -5_000;
+
 pub struct SearchInfo {
     pub nodes: u64,
     pub start_time: Instant,
@@ -88,7 +100,9 @@ pub struct Search {
     movegen: MoveGenerator,
     tt: TranspositionTable,
     killer_moves: [[Option<Move>; 2]; MAX_DEPTH as usize],
+    counter_moves: [[[Option<Move>; 64]; 6]; 2], // [цвет][фигура prev][to prev] -> контрход
     history_table: [[i32; 64]; 64], // [from][to]
+    lmr_table: [[u8; 64]; 64],             // [depth][move] — базовые редукции LMR
     pv_table: [[Option<Move>; MAX_DEPTH as usize]; MAX_DEPTH as usize], // Principal Variation
     pv_length: [usize; MAX_DEPTH as usize],
     path: [u64; MAX_DEPTH as usize],   // хэши позиций на текущей ветке (для повторений)
@@ -98,11 +112,21 @@ pub struct Search {
 
 impl Search {
     pub fn new() -> Self {
+        // Таблица базовых LMR-редукций: r(depth, move) = floor(0.7 + ln(d)*ln(m)/2.25)
+        let mut lmr_table = [[0u8; 64]; 64];
+        for d in 1..64usize {
+            for m in 1..64usize {
+                let r = 0.7 + (d as f32).ln() * (m as f32).ln() / 2.25;
+                lmr_table[d][m] = r.floor().max(0.0).min(60.0) as u8;
+            }
+        }
         Self {
             movegen: MoveGenerator::new(),
             tt: TranspositionTable::new_default(),
             killer_moves: [[None; 2]; MAX_DEPTH as usize],
+            counter_moves: [[[None; 64]; 6]; 2],
             history_table: [[0; 64]; 64],
+            lmr_table,
             pv_table: [[None; MAX_DEPTH as usize]; MAX_DEPTH as usize],
             pv_length: [0; MAX_DEPTH as usize],
             path: [0; MAX_DEPTH as usize],
@@ -132,6 +156,8 @@ impl Search {
         let mut best_move = None;
         let mut best_score;
         let mut prev_score = 0;
+        // Сколько итераций подряд лучш. ход не менялся (для тайм-менеджмента)
+        let mut stable_count: u32 = 0;
 
         self.tt.new_search();
 
@@ -149,11 +175,19 @@ impl Search {
                 break;
             }
 
-            // Не начинаем новую итерацию, если съедено >60% времени:
-            // следующая итерация всё равно не успеет закончиться
+            // Не начинаем новую итерацию, если времени явно не хватит.
+            // Порог зависит от стабильности лучшего хода: устойчивый ход —
+            // экономим время, «скачущий» — не бросаем итерацию недоделанной.
             if current_depth > 1 && best_move.is_some() {
                 if let Some(limit) = info.time_limit {
-                    if info.start_time.elapsed() * 10 >= limit * 6 {
+                    let pct = if stable_count >= 5 {
+                        45
+                    } else if stable_count >= 2 {
+                        60
+                    } else {
+                        80
+                    };
+                    if info.start_time.elapsed().as_millis() * 100 >= limit.as_millis() * pct {
                         break;
                     }
                 }
@@ -171,7 +205,7 @@ impl Search {
             let mut researches = 0;
 
             loop {
-                best_score = self.search(board, current_depth, alpha, beta, 0, true, &mut info);
+                best_score = self.search(board, current_depth, alpha, beta, 0, true, None, &mut info);
 
                 if info.should_stop() {
                     break;
@@ -207,7 +241,14 @@ impl Search {
 
             if !info.should_stop() {
                 prev_score = best_score;
-                best_move = self.pv_table[0][0];
+                let new_best = self.pv_table[0][0];
+                // Обновляем счётчик стабильности лучшего хода
+                if Self::same_move(new_best, best_move) {
+                    stable_count = stable_count.saturating_add(1);
+                } else {
+                    stable_count = 0;
+                }
+                best_move = new_best;
 
                 // UCI info output with PV line.
                 // Печатаем ВСЕГДА (даже без хода): при матах/патах в корне
@@ -276,6 +317,15 @@ impl Search {
         legal.into_iter().next()
     }
 
+    /// Сравнение ходов по существу (from/to/promotion): у Move нет PartialEq
+    fn same_move(a: Option<Move>, b: Option<Move>) -> bool {
+        match (a, b) {
+            (Some(x), Some(y)) => x.from == y.from && x.to == y.to && x.promotion == y.promotion,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     #[inline]
     fn score_to_tt(score: i32, ply: u8) -> i32 {
         if score >= MATE_BOUND {
@@ -298,7 +348,7 @@ impl Search {
         }
     }
 
-    fn search(&mut self, board: &Board, mut depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, info: &mut SearchInfo) -> i32 {
+    fn search(&mut self, board: &Board, mut depth: u8, mut alpha: i32, mut beta: i32, ply: u8, do_null: bool, prev_move: Option<Move>, info: &mut SearchInfo) -> i32 {
         info.nodes += 1;
 
         // Длина PV для этого узла инициализируется сразу, чтобы родитель
@@ -317,6 +367,10 @@ impl Search {
         let is_pv_node = beta - alpha > 1;
         let hash = board.hash; // инкрементальный хэш — без пересчёта с нуля
         let in_check = board.in_check();
+
+        // ФИКС: раньше path[] только читался и никогда не заполнялся —
+        // поиск не видел повторений по своей ветке. Заполняем стек позиций.
+        self.path[ply as usize] = hash;
 
         // Правило 50 ходов. Мат важнее ничьей: под шахом проверяем, есть ли мат.
         if board.halfmove_clock >= 100 {
@@ -381,13 +435,26 @@ impl Search {
         let static_eval = if in_check { -INFINITY } else { Evaluator::evaluate(board) };
 
         // Reverse futility pruning: позиция настолько хороша, что даже с запасом выше beta
+        let rfp_margin = RFP_MARGIN * depth as i32;
         if !is_pv_node
             && !in_check
             && depth <= RFP_MAX_DEPTH
             && beta.abs() < MATE_BOUND
-            && static_eval - RFP_MARGIN * depth as i32 >= beta
+            && static_eval - rfp_margin >= beta
         {
-            return static_eval - RFP_MARGIN * depth as i32;
+            return static_eval - rfp_margin;
+        }
+
+        let moves = self.movegen.generate_moves(board);
+
+        // Checkmate/stalemate detection — до отсечений: пат и мат нельзя
+        // «отрезать» null move'ом или ProbCut'ом
+        if moves.is_empty() {
+            if in_check {
+                return -MATE_SCORE + ply as i32; // Prefer faster mate
+            } else {
+                return 0; // Stalemate
+            }
         }
 
         // Null Move Pruning - skip if in check or no non-pawn material (zugzwang)
@@ -405,8 +472,11 @@ impl Search {
             // null-move меняет сторону и сбрасывает ep — корректируем хэш
             null_board.hash = Zobrist::null_move_hash(board);
 
-            // Адаптивная редукция: чем глубже, тем больше режем
-            let r = NULL_MOVE_REDUCTION + depth / 4;
+            // Адаптивная редукция: чем глубже, тем больше режем; чем больше
+            // перевес статической оценки над beta — тем агрессивнее
+            let r = NULL_MOVE_REDUCTION
+                + depth / 4
+                + (((static_eval - beta) / 200).clamp(0, 2) as u8);
 
             let null_score = -self.search(
                 &null_board,
@@ -415,6 +485,7 @@ impl Search {
                 -beta + 1,
                 ply + 1,
                 false,
+                None,
                 info
             );
 
@@ -425,6 +496,46 @@ impl Search {
             if null_score >= beta {
                 // Null move cutoff (матовые счета из null move не доверяем)
                 return if null_score >= MATE_BOUND { beta } else { null_score.min(beta) };
+            }
+        }
+
+        // ProbCut (классическая схема): если выгодное взятие уже на урезанной
+        // глубине пробивает beta+маржу, полный перебор тоже был бы выше beta.
+        // Порог SEE автоматически ограничивает частоту срабатывания:
+        // static_eval + SEE взятия должны дотягивать до probcut_beta.
+        if !is_pv_node
+            && !in_check
+            && depth >= PROBCUT_MIN_DEPTH
+            && beta.abs() < MATE_BOUND
+        {
+            let probcut_beta = beta + PROBCUT_BETA_MARGIN;
+            let mut tried = 0usize;
+            for mv in moves.iter() {
+                if mv.captured.is_none() || tried >= PROBCUT_MAX_MOVES {
+                    continue;
+                }
+                if static_eval + SEE::evaluate(board, mv) < probcut_beta {
+                    continue;
+                }
+                let mut pc_board = *board;
+                pc_board.make_move(*mv);
+                tried += 1;
+                let pc_score = -self.search(
+                    &pc_board,
+                    depth.saturating_sub(4),
+                    -probcut_beta,
+                    -probcut_beta + 1,
+                    ply + 1,
+                    false,
+                    None,
+                    info
+                );
+                if info.stop {
+                    return 0;
+                }
+                if pc_score >= probcut_beta {
+                    return beta;
+                }
             }
         }
 
@@ -447,23 +558,19 @@ impl Search {
             }
         }
 
-        let moves = self.movegen.generate_moves(board);
-
-        // Checkmate/stalemate detection
-        if moves.is_empty() {
-            if in_check {
-                return -MATE_SCORE + ply as i32; // Prefer faster mate
-            } else {
-                return 0; // Stalemate
-            }
-        }
-
         // Move ordering for better pruning
-        let ordered_moves = self.order_moves(moves, tt_move, ply);
+        let us = board.side_to_move as usize;
+        let counter = prev_move
+            .and_then(|pm| self.counter_moves[us][pm.piece as usize][pm.to as usize]);
+        let ordered_moves = self.order_moves(moves, tt_move, ply, counter);
 
         let mut best_move = None;
         let original_alpha = alpha;
         let mut quiet_count: usize = 0;
+        // Тихие ходы, уже проверенные в этом узле: при отсечении более поздним
+        // тихим ходом им начисляется malus в таблицу истории
+        let mut searched_quiets: [Option<Move>; 32] = [None; 32];
+        let mut searched_quiets_len = 0usize;
 
         for (move_num, mv) in ordered_moves.iter().enumerate() {
             let is_quiet = mv.captured.is_none() && mv.promotion.is_none();
@@ -472,13 +579,15 @@ impl Search {
             let gives_check = Self::move_gives_check(board, mv);
 
             // Late Move Pruning: на малых глубинах тихие ходы после лимита не ищем
+            // (индекс ограничен 3: на глубинах > 3 лимит не используется)
+            let lmp_limit = LMP_LIMIT[depth.min(3) as usize];
             if !is_pv_node
                 && !in_check
                 && !gives_check
                 && is_quiet
                 && depth <= 3
                 && move_num > 0
-                && quiet_count >= LMP_LIMIT[depth as usize]
+                && quiet_count >= lmp_limit
             {
                 continue;
             }
@@ -513,6 +622,10 @@ impl Search {
             new_board.make_move(*mv);
             if is_quiet {
                 quiet_count += 1;
+                if searched_quiets_len < searched_quiets.len() {
+                    searched_quiets[searched_quiets_len] = Some(*mv);
+                    searched_quiets_len += 1;
+                }
             }
 
             // Check extension — ограничиваем, чтобы цепочки шахов не раздували дерево
@@ -535,10 +648,11 @@ impl Search {
                     -alpha,
                     ply + 1,
                     true,
+                    Some(*mv),
                     info
                 );
             } else {
-                // Late Move Reductions (LMR)
+                // Late Move Reductions (LMR): таблица + корректировки
                 let mut reduction: u8 = 0;
                 if move_num >= LMR_FULL_DEPTH_MOVES
                     && depth >= LMR_MIN_DEPTH
@@ -546,11 +660,18 @@ impl Search {
                     && !gives_check
                     && is_quiet
                 {
-                    let mut r = (0.7 + (depth as f32).ln() * ((move_num + 1) as f32).ln() / 2.25) as u8;
+                    let mut r = self.lmr_table[depth.min(63) as usize]
+                        [(move_num + 1).min(63) as usize] as i32;
                     if is_pv_node {
-                        r = r.saturating_sub(1);
+                        r -= 1;
                     }
-                    reduction = r.max(1).min(depth - 1);
+                    let hist = self.history_table[mv.from as usize][mv.to as usize];
+                    if hist > LMR_HISTORY_GOOD {
+                        r -= 1;
+                    } else if hist < LMR_HISTORY_BAD {
+                        r += 1;
+                    }
+                    reduction = (r.max(1) as u8).min(depth - 1);
                 }
 
                 // PVS: сначала нулевое окно (с редукцией, если она есть)
@@ -561,6 +682,7 @@ impl Search {
                     -alpha,
                     ply + 1,
                     true,
+                    Some(*mv),
                     info
                 );
 
@@ -573,6 +695,7 @@ impl Search {
                         -alpha,
                         ply + 1,
                         true,
+                        Some(*mv),
                         info
                     );
                 }
@@ -586,6 +709,7 @@ impl Search {
                         -alpha,
                         ply + 1,
                         true,
+                        Some(*mv),
                         info
                     );
                 }
@@ -600,14 +724,36 @@ impl Search {
                 // Beta cutoff
                 if mv.captured.is_none() {
                     self.store_killer_move(*mv, ply);
+
+                    // Контрход: лучший ответ на предыдущий ход в этой ветке
+                    if let Some(pm) = prev_move {
+                        self.counter_moves[us][pm.piece as usize][pm.to as usize] = Some(*mv);
+                    }
+
                     // i32 вместо u8: (depth * depth) в u8 переполняется при depth >= 16
                     let bonus = (depth as i32) * (depth as i32);
-                    let h = &mut self.history_table[mv.from as usize][mv.to as usize];
-                    *h += bonus;
-                    if *h > HISTORY_LIMIT {
-                        for row in self.history_table.iter_mut() {
-                            for v in row.iter_mut() {
-                                *v /= 2;
+                    {
+                        let h = &mut self.history_table[mv.from as usize][mv.to as usize];
+                        *h += bonus;
+                        if *h > HISTORY_LIMIT {
+                            for row in self.history_table.iter_mut() {
+                                for v in row.iter_mut() {
+                                    *v /= 2;
+                                }
+                            }
+                        }
+                    }
+
+                    // Malus тихим ходам, которые не дали отсечения раньше нашего
+                    for i in 0..searched_quiets_len {
+                        if let Some(q) = searched_quiets[i] {
+                            if q.from == mv.from && q.to == mv.to {
+                                continue;
+                            }
+                            let h = &mut self.history_table[q.from as usize][q.to as usize];
+                            *h -= bonus;
+                            if *h < -HISTORY_LIMIT {
+                                *h = -HISTORY_LIMIT;
                             }
                         }
                     }
@@ -841,8 +987,9 @@ impl Search {
         }
     }
 
-    fn order_moves(&self, mut moves: Vec<Move>, tt_move: Option<Move>, ply: u8) -> Vec<Move> {
-        // Ход из TT передаётся снаружи: он уже прочитан для IIR, не читаем дважды
+    fn order_moves(&self, mut moves: Vec<Move>, tt_move: Option<Move>, ply: u8, counter: Option<Move>) -> Vec<Move> {
+        // Ход из TT передаётся снаружи: он уже прочитан для IIR, не читаем дважды.
+        // Контрход тоже приходит снаружи — вычислен вызывающей стороной.
         moves.sort_by_cached_key(|mv| {
             // Приоритеты: TT > взятия (MVV-LVA) > превращения > киллеры > история
             if let Some(tt_mv) = tt_move {
@@ -873,7 +1020,14 @@ impl Search {
                     }
                 }
 
-                // История всегда меньше киллеров и взятий (ограничена HISTORY_LIMIT)
+                // Контрход: приоритет между киллерами и историей
+                if let Some(cm) = counter {
+                    if cm.from == mv.from && cm.to == mv.to {
+                        score += COUNTERMOVE_SCORE;
+                    }
+                }
+
+                // История всегда меньше киллеров, контрходов и взятий (ограничена HISTORY_LIMIT)
                 score += self.history_table[mv.from as usize][mv.to as usize].min(HISTORY_LIMIT);
             }
 
@@ -952,6 +1106,7 @@ impl Search {
     pub fn clear_tt(&mut self) {
         self.tt.clear();
         self.killer_moves = [[None; 2]; MAX_DEPTH as usize];
+        self.counter_moves = [[[None; 64]; 6]; 2];
         self.history_table = [[0; 64]; 64];
     }
 }
