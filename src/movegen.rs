@@ -2,11 +2,31 @@ use crate::board::{Board, Bitboard, Piece, Color, Move};
 use crate::magic::MagicBitboards;
 use std::sync::OnceLock;
 
-// Precalculated attack tables for fast move generation
+/// Генератор ходов.
+///
+/// v1.1.0 — ПОЛНАЯ ЛЕГАЛЬНАЯ генерация без перебора с make/unmake:
+///   * маска шаха: клетки-блокаторы + клетка шахующей фигуры (при двойном
+///     шахе ходят только королём);
+///   * маски связок: связанная фигура может двигаться только по линии
+///     «король — пиннер» (таблица between);
+///   * ходы короля проверяются по «опасным» клеткам, посчитанным с УДАЛЁННЫМ
+///     королём — это учитывает рентген-линии за королём;
+///   * взятия королём (за снятой фигурой может вскрыться линия) и взятия на
+///     проходе (исчезают сразу две пешки) валидируются make_move — случаи
+///     редкие, цена нулевая;
+///   * новая таблица `between[a][b]` — клетки строго между двумя полями.
+///
+/// Раньше generate_moves генерировал псевдолегальные ходы и прогонял каждый
+/// через копию доски + make_move + проверку шаха — это съедало больше половины
+/// времени поиска. Теперь легальность гарантируется масками при генерации.
+///
+/// Плюс отдельный вход `generate_captures` для quiescence: только взятия и
+/// превращения в ферзя (при шахе — все уклонения), тихие ходы не генерируются.
 pub struct MoveGenerator {
     knight_attacks: [Bitboard; 64],
     king_attacks: [Bitboard; 64],
     pawn_attacks: [[Bitboard; 64]; 2], // [color][square]
+    between: [[Bitboard; 64]; 64],
 }
 
 static SHARED_MOVEGEN: OnceLock<MoveGenerator> = OnceLock::new();
@@ -23,6 +43,7 @@ impl MoveGenerator {
             knight_attacks: [0; 64],
             king_attacks: [0; 64],
             pawn_attacks: [[0; 64]; 2],
+            between: [[0; 64]; 64],
         };
         gen.init_tables();
         gen
@@ -35,11 +56,42 @@ impl MoveGenerator {
             self.pawn_attacks[0][sq] = Self::generate_pawn_attacks(sq, Color::White);
             self.pawn_attacks[1][sq] = Self::generate_pawn_attacks(sq, Color::Black);
         }
+        for a in 0..64 {
+            for b in 0..64 {
+                self.between[a][b] = Self::compute_between(a, b);
+            }
+        }
+    }
+
+    /// Клетки СТРОГО между двумя полями на одной линии (пусто, если не на линии).
+    fn compute_between(a: usize, b: usize) -> Bitboard {
+        let (ar, af) = ((a / 8) as i32, (a % 8) as i32);
+        let (br, bf) = ((b / 8) as i32, (b % 8) as i32);
+        let (dr, df) = (br - ar, bf - af);
+        let aligned = dr == 0 || df == 0 || dr.abs() == df.abs();
+        if a == b || !aligned {
+            return 0;
+        }
+        let (sr, sf) = (dr.signum(), df.signum());
+        let mut mask = 0u64;
+        let mut r = ar + sr;
+        let mut f = af + sf;
+        while r != br || f != bf {
+            mask |= 1u64 << (r * 8 + f);
+            r += sr;
+            f += sf;
+        }
+        mask
     }
 
     #[inline]
     pub fn knight_attacks_at(&self, square: usize) -> Bitboard {
         self.knight_attacks[square]
+    }
+
+    #[inline]
+    pub fn king_attacks_at(&self, square: usize) -> Bitboard {
+        self.king_attacks[square]
     }
 
     #[inline]
@@ -138,16 +190,239 @@ impl MoveGenerator {
         attacks
     }
 
-    /// Только легальные ходы (псевдолегальные + фильтр шаха своему королю)
+    /// Полный набор легальных ходов.
     pub fn generate_moves(&self, board: &Board) -> Vec<Move> {
-        let mut moves = self.generate_pseudo_legal(board);
+        self.generate_legal(board, false)
+    }
+
+    /// Легальные взятия и превращения в ферзя (для quiescence).
+    /// Если сторона под шахом — все легальные уклонения.
+    pub fn generate_captures(&self, board: &Board) -> Vec<Move> {
+        self.generate_legal(board, true)
+    }
+
+    fn generate_legal(&self, board: &Board, mut captures_only: bool) -> Vec<Move> {
         let us = board.side_to_move;
-        moves.retain(|&mv| {
-            let mut b = *board;
-            b.make_move(mv);
-            let k = b.pieces[us as usize][Piece::King as usize];
-            k == 0 || !b.is_square_attacked(k.trailing_zeros() as u8, us.opposite())
-        });
+        let them = us.opposite();
+        let ui = us as usize;
+        let ti = them as usize;
+        let magic = MagicBitboards::get();
+        let king_bb = board.pieces[ui][Piece::King as usize];
+
+        // Позиция без короля (некорректный FEN) — старый медленный путь как fallback.
+        if king_bb == 0 {
+            let mut moves = self.generate_pseudo_legal(board);
+            moves.retain(|&mv| {
+                let mut b = *board;
+                b.make_move(mv);
+                let k = b.pieces[ui][Piece::King as usize];
+                k == 0 || !b.is_square_attacked(k.trailing_zeros() as u8, them)
+            });
+            return moves;
+        }
+
+        let ksq = king_bb.trailing_zeros() as usize;
+        let own = board.occupied[ui];
+        let their = board.occupied[ti];
+        let all = board.all_occupied;
+
+        let rook_like = board.pieces[ti][Piece::Rook as usize] | board.pieces[ti][Piece::Queen as usize];
+        let bishop_like = board.pieces[ti][Piece::Bishop as usize] | board.pieces[ti][Piece::Queen as usize];
+
+        // --- Шахующие фигуры ---
+        // Пешка бьёт короля с полей, которые атаковала бы наша пешка, стоя на короле.
+        let mut checkers = self.pawn_attacks[ui][ksq] & board.pieces[ti][Piece::Pawn as usize];
+        checkers |= self.knight_attacks[ksq] & board.pieces[ti][Piece::Knight as usize];
+        checkers |= magic.get_rook_attacks(ksq, all) & rook_like;
+        checkers |= magic.get_bishop_attacks(ksq, all) & bishop_like;
+
+        let in_check = checkers != 0;
+        // В quiescence под шахом нужны ВСЕ уклонения, а не только взятия.
+        captures_only = captures_only && !in_check;
+
+        let check_mask: Bitboard = if checkers == 0 {
+            !0u64
+        } else if checkers.count_ones() > 1 {
+            0 // двойной шах: не-королевских ходов не существует
+        } else {
+            let csq = checkers.trailing_zeros() as usize;
+            self.between[ksq][csq] | (1u64 << csq)
+        };
+
+        // --- Связки (pins): линия «король — пиннер», по которой может ходить связанная фигура ---
+        let mut pin_line = [0u64; 64];
+        let mut snipers = (magic.get_rook_attacks(ksq, 0) & rook_like)
+            | (magic.get_bishop_attacks(ksq, 0) & bishop_like);
+        while snipers != 0 {
+            let ssq = snipers.trailing_zeros() as usize;
+            snipers &= snipers - 1;
+            let between = self.between[ksq][ssq];
+            let blockers = between & all;
+            if blockers.count_ones() == 1 && (blockers & own) != 0 {
+                let psq = blockers.trailing_zeros() as usize;
+                pin_line[psq] = between | (1u64 << ssq);
+            }
+        }
+
+        let mut moves: Vec<Move> = Vec::with_capacity(48);
+
+        // --- Ходы короля ---
+        // Опасные поля считаем с удалённым королём: уходя по линии шахующей
+        // ладьи/ферзя, король не должен попадать под рентген за собой.
+        let occ_no_king = all & !king_bb;
+        let mut danger = 0u64;
+        let mut bb = board.pieces[ti][Piece::Pawn as usize];
+        while bb != 0 {
+            let s = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            danger |= self.pawn_attacks[ti][s];
+        }
+        bb = board.pieces[ti][Piece::Knight as usize];
+        while bb != 0 {
+            let s = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            danger |= self.knight_attacks[s];
+        }
+        bb = board.pieces[ti][Piece::Bishop as usize];
+        while bb != 0 {
+            let s = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            danger |= magic.get_bishop_attacks(s, occ_no_king);
+        }
+        bb = board.pieces[ti][Piece::Rook as usize];
+        while bb != 0 {
+            let s = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            danger |= magic.get_rook_attacks(s, occ_no_king);
+        }
+        bb = board.pieces[ti][Piece::Queen as usize];
+        while bb != 0 {
+            let s = bb.trailing_zeros() as usize;
+            bb &= bb - 1;
+            danger |= magic.get_bishop_attacks(s, occ_no_king) | magic.get_rook_attacks(s, occ_no_king);
+        }
+        let ek = board.pieces[ti][Piece::King as usize];
+        if ek != 0 {
+            danger |= self.king_attacks[ek.trailing_zeros() as usize];
+        }
+
+        let mut king_targets = self.king_attacks[ksq] & !own & !danger;
+        if captures_only {
+            king_targets &= their;
+        }
+        let mut kt = king_targets;
+        while kt != 0 {
+            let to = kt.trailing_zeros() as u8;
+            kt &= kt - 1;
+            let captured = self.get_captured_piece(to, board, ti);
+            if captured.is_some() {
+                // Взятие королём: за снятой фигурой может вскрыться линия на
+                // новое поле короля — проверяем реальным make_move.
+                let mv = Move {
+                    from: ksq as u8,
+                    to,
+                    piece: Piece::King,
+                    captured,
+                    promotion: None,
+                    is_castle: false,
+                    is_en_passant: false,
+                };
+                let mut b2 = *board;
+                b2.make_move(mv);
+                let k2 = b2.pieces[ui][Piece::King as usize];
+                if k2 == 0 || !b2.is_square_attacked(k2.trailing_zeros() as u8, them) {
+                    moves.push(mv);
+                }
+            } else {
+                moves.push(Move {
+                    from: ksq as u8,
+                    to,
+                    piece: Piece::King,
+                    captured: None,
+                    promotion: None,
+                    is_castle: false,
+                    is_en_passant: false,
+                });
+            }
+        }
+
+        // --- Остальные фигуры (при двойном шахе ходит только король) ---
+        if checkers.count_ones() < 2 {
+            // Кони: связанный конь не имеет ни одного хода.
+            let mut bb = board.pieces[ui][Piece::Knight as usize];
+            while bb != 0 {
+                let from = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                if pin_line[from as usize] != 0 {
+                    continue;
+                }
+                let mut targets = self.knight_attacks[from as usize] & !own & check_mask;
+                if captures_only {
+                    targets &= their;
+                }
+                self.add_moves_from_bitboard(from, targets, Piece::Knight, board, &mut moves);
+            }
+
+            // Слоны (Magic Bitboards)
+            let mut bb = board.pieces[ui][Piece::Bishop as usize];
+            while bb != 0 {
+                let from = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                let pin = pin_line[from as usize];
+                let mut targets = magic.get_bishop_attacks(from as usize, all) & !own & check_mask;
+                if pin != 0 {
+                    targets &= pin;
+                }
+                if captures_only {
+                    targets &= their;
+                }
+                self.add_moves_from_bitboard(from, targets, Piece::Bishop, board, &mut moves);
+            }
+
+            // Ладьи (Magic Bitboards)
+            let mut bb = board.pieces[ui][Piece::Rook as usize];
+            while bb != 0 {
+                let from = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                let pin = pin_line[from as usize];
+                let mut targets = magic.get_rook_attacks(from as usize, all) & !own & check_mask;
+                if pin != 0 {
+                    targets &= pin;
+                }
+                if captures_only {
+                    targets &= their;
+                }
+                self.add_moves_from_bitboard(from, targets, Piece::Rook, board, &mut moves);
+            }
+
+            // Ферзи (Magic Bitboards)
+            let mut bb = board.pieces[ui][Piece::Queen as usize];
+            while bb != 0 {
+                let from = bb.trailing_zeros() as u8;
+                bb &= bb - 1;
+                let pin = pin_line[from as usize];
+                let mut targets = (magic.get_bishop_attacks(from as usize, all)
+                    | magic.get_rook_attacks(from as usize, all))
+                    & !own
+                    & check_mask;
+                if pin != 0 {
+                    targets &= pin;
+                }
+                if captures_only {
+                    targets &= their;
+                }
+                self.add_moves_from_bitboard(from, targets, Piece::Queen, board, &mut moves);
+            }
+
+            // Пешки
+            self.generate_pawn_moves(board, captures_only, check_mask, &pin_line, ui, ti, &mut moves);
+
+            // Рокировка (тихий ход; generate_castling сама проверяет шах/атаки полей)
+            if !captures_only {
+                self.generate_castling(board, &mut moves);
+            }
+        }
+
         moves
     }
 
@@ -200,14 +475,17 @@ impl MoveGenerator {
         }
     }
 
+    /// Псевдолегальные ходы — остался только как fallback для позиций без короля.
     fn generate_pseudo_legal(&self, board: &Board) -> Vec<Move> {
         let mut moves = Vec::with_capacity(128);
         let color = board.side_to_move;
         let color_idx = color as usize;
+        let opp_color_idx = color.opposite() as usize;
         let magic = MagicBitboards::get();
+        let empty_pins = [0u64; 64];
 
         // Generate pawn moves
-        self.generate_pawn_moves(board, &mut moves);
+        self.generate_pawn_moves(board, false, !0u64, &empty_pins, color_idx, opp_color_idx, &mut moves);
 
         // Generate knight moves
         let mut knights = board.pieces[color_idx][Piece::Knight as usize];
@@ -268,40 +546,71 @@ impl MoveGenerator {
         moves
     }
 
-    fn generate_pawn_moves(&self, board: &Board, moves: &mut Vec<Move>) {
+    /// Пешки с масками легальности: `check_mask` ограничивает поля при шахе,
+    /// `pin_line[sq]` — линию связки (0 = не связан). Взятия на проходе
+    /// валидируются make_move (редкий случай, покрывает все крайние случаи).
+    #[allow(clippy::too_many_arguments)]
+    fn generate_pawn_moves(
+        &self,
+        board: &Board,
+        captures_only: bool,
+        check_mask: Bitboard,
+        pin_line: &[u64; 64],
+        ui: usize,
+        ti: usize,
+        moves: &mut Vec<Move>,
+    ) {
         let color = board.side_to_move;
-        let color_idx = color as usize;
-        let opp_color_idx = color.opposite() as usize;
-        let direction = if color == Color::White { 8 } else { -8 };
-        let start_rank = if color == Color::White { 1 } else { 6 };
-        let promotion_rank = if color == Color::White { 7 } else { 0 };
+        let direction: i32 = if color == Color::White { 8 } else { -8 };
+        let start_rank: u8 = if color == Color::White { 1 } else { 6 };
+        let promotion_rank: u8 = if color == Color::White { 7 } else { 0 };
+        let all = board.all_occupied;
+        let their = board.occupied[ti];
+        let them_c = if ui == 0 { Color::Black } else { Color::White };
 
-        let mut pawns = board.pieces[color_idx][Piece::Pawn as usize];
-
+        let mut pawns = board.pieces[ui][Piece::Pawn as usize];
         while pawns != 0 {
             let from = pawns.trailing_zeros() as u8;
             pawns &= pawns - 1;
-
+            let pin = pin_line[from as usize];
             let from_rank = from / 8;
 
-            // Single push
-            let to = (from as i8 + direction) as u8;
-            if (board.all_occupied & (1u64 << to)) == 0 {
-                // Check for promotion
+            // Single push / Double push
+            // v1.1.0 FIX: двойной ход проверяется НЕЗАВИСИМО от одиночного:
+            // одиночный может не закрывать шах, а двойной — закрывать
+            // (b7-b5 при шахе ферзя по диагонали через b5).
+            let to = (from as i32 + direction) as u8;
+            let to_bb = 1u64 << to;
+            let to_free = (all & to_bb) == 0 && (pin == 0 || (pin & to_bb) != 0);
+            if to_free {
                 if to / 8 == promotion_rank {
-                    // Generate all promotion moves
-                    for promo_piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
-                        moves.push(Move {
-                            from,
-                            to,
-                            piece: Piece::Pawn,
-                            captured: None,
-                            promotion: Some(promo_piece),
-                            is_castle: false,
-                            is_en_passant: false,
-                        });
+                    if (check_mask & to_bb) != 0 {
+                        if captures_only {
+                            // Для qsearch тихое превращение — только в ферзя
+                            moves.push(Move {
+                                from,
+                                to,
+                                piece: Piece::Pawn,
+                                captured: None,
+                                promotion: Some(Piece::Queen),
+                                is_castle: false,
+                                is_en_passant: false,
+                            });
+                        } else {
+                            for promo_piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
+                                moves.push(Move {
+                                    from,
+                                    to,
+                                    piece: Piece::Pawn,
+                                    captured: None,
+                                    promotion: Some(promo_piece),
+                                    is_castle: false,
+                                    is_en_passant: false,
+                                });
+                            }
+                        }
                     }
-                } else {
+                } else if !captures_only && (check_mask & to_bb) != 0 {
                     moves.push(Move {
                         from,
                         to,
@@ -311,36 +620,40 @@ impl MoveGenerator {
                         is_castle: false,
                         is_en_passant: false,
                     });
+                }
 
-                    // Double push
-                    if from_rank == start_rank {
-                        let to2 = (from as i8 + direction * 2) as u8;
-                        if (board.all_occupied & (1u64 << to2)) == 0 {
-                            moves.push(Move {
-                                from,
-                                to: to2,
-                                piece: Piece::Pawn,
-                                captured: None,
-                                promotion: None,
-                                is_castle: false,
-                                is_en_passant: false,
-                            });
-                        }
+                // Double push
+                if !captures_only && from_rank == start_rank {
+                    let to2 = (from as i32 + direction * 2) as u8;
+                    let to2_bb = 1u64 << to2;
+                    if (all & to2_bb) == 0
+                        && (check_mask & to2_bb) != 0
+                        && (pin == 0 || (pin & to2_bb) != 0)
+                    {
+                        moves.push(Move {
+                            from,
+                            to: to2,
+                            piece: Piece::Pawn,
+                            captured: None,
+                            promotion: None,
+                            is_castle: false,
+                            is_en_passant: false,
+                        });
                     }
                 }
             }
 
             // Captures
-            let attacks = self.pawn_attacks[color_idx][from as usize];
-            let mut captures = attacks & board.occupied[opp_color_idx];
-
+            let mut captures = self.pawn_attacks[ui][from as usize] & their & check_mask;
+            if pin != 0 {
+                captures &= pin;
+            }
             while captures != 0 {
                 let to = captures.trailing_zeros() as u8;
                 captures &= captures - 1;
 
-                let captured = self.get_captured_piece(to, board, opp_color_idx);
+                let captured = self.get_captured_piece(to, board, ti);
 
-                // Check for promotion
                 if to / 8 == promotion_rank {
                     for promo_piece in [Piece::Queen, Piece::Rook, Piece::Bishop, Piece::Knight] {
                         moves.push(Move {
@@ -366,10 +679,12 @@ impl MoveGenerator {
                 }
             }
 
-            // En passant
+            // En passant: маски не применяем — валидация make_move надёжнее
+            // (связка по диагонали, вскрытый шах по горизонтали после
+            // исчезновения обеих пешек, взятие шахующей пешки).
             if let Some(ep_square) = board.en_passant_square {
-                if (attacks & (1u64 << ep_square)) != 0 {
-                    moves.push(Move {
+                if self.pawn_attacks[ui][from as usize] & (1u64 << ep_square) != 0 {
+                    let mv = Move {
                         from,
                         to: ep_square,
                         piece: Piece::Pawn,
@@ -377,7 +692,13 @@ impl MoveGenerator {
                         promotion: None,
                         is_castle: false,
                         is_en_passant: true,
-                    });
+                    };
+                    let mut b2 = *board;
+                    b2.make_move(mv);
+                    let k2 = b2.pieces[ui][Piece::King as usize];
+                    if k2 == 0 || !b2.is_square_attacked(k2.trailing_zeros() as u8, them_c) {
+                        moves.push(mv);
+                    }
                 }
             }
         }

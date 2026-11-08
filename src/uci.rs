@@ -49,13 +49,15 @@ impl UciEngine {
                 "quit" => break,
                 "d" | "display" => self.display(),
                 "clear" => self.clear_tt(),
+                // v1.1.0: perft с делением по корневым ходам — отладка генератора ходов
+                "perft" => self.perft(&parts[1..]),
                 _ => {}
             }
         }
     }
 
     fn uci(&self) {
-        println!("id name Noksiy 1.0.0");
+        println!("id name Noksiy 1.1.0");
         println!("id author nesstyx & Claude (AI-generated)");
         println!("option name Hash type spin default 128 min 1 max 1024");
         println!("option name Clear Hash type button");
@@ -107,6 +109,58 @@ impl UciEngine {
     fn clear_tt(&mut self) {
         self.search.clear_tt();
         println!("info string Transposition table cleared");
+    }
+
+    /// v1.1.0: `perft <depth>` — узлы по всем легальным корневым ходам + сумма.
+    /// Утилита проверки генератора ходов (эталоны: perft-позиции CPW).
+    fn perft(&self, args: &[&str]) {
+        let depth: u8 = match args.first().and_then(|s| s.parse().ok()) {
+            Some(d) => d,
+            None => {
+                println!("info string usage: perft <depth>");
+                return;
+            }
+        };
+        let gen = crate::movegen::MoveGenerator::get();
+        let start = std::time::Instant::now();
+        let mut total = 0u64;
+        for mv in gen.generate_moves(&self.board) {
+            let mut b = self.board;
+            b.make_move(mv);
+            let nodes = Self::perft_recurse(&b, gen, depth - 1);
+            let mut label = format!(
+                "{}{}",
+                Self::square_to_algebraic(mv.from),
+                Self::square_to_algebraic(mv.to)
+            );
+            if let Some(promo) = mv.promotion {
+                label.push(match promo {
+                    crate::board::Piece::Queen => 'q',
+                    crate::board::Piece::Rook => 'r',
+                    crate::board::Piece::Bishop => 'b',
+                    crate::board::Piece::Knight => 'n',
+                    _ => 'q',
+                });
+            }
+            println!("{}: {}", label, nodes);
+            total += nodes;
+        }
+        let ms = start.elapsed().as_millis();
+        let nps = if ms > 0 { total * 1000 / ms as u64 } else { total };
+        println!("nodes {} time {}ms nps {}", total, ms, nps);
+    }
+
+    fn perft_recurse(board: &Board, gen: &crate::movegen::MoveGenerator, depth: u8) -> u64 {
+        if depth == 0 {
+            return 1;
+        }
+        let mut nodes = 0u64;
+        for mv in gen.generate_moves(board) {
+            let mut b = *board;
+            b.make_move(mv);
+            nodes += Self::perft_recurse(&b, gen, depth - 1);
+        }
+        nodes
     }
 
     fn position(&mut self, args: &[&str]) {

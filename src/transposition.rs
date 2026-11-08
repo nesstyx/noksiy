@@ -14,6 +14,16 @@ pub enum NodeType {
     UpperBound, // Cut node - score <= alpha
 }
 
+/// v1.1.0: полный снимок записи TT — для singular extensions нужен доступ
+/// к глубине/типу узла/ходу без повторного лукапа.
+#[derive(Clone, Copy)]
+pub struct TTData {
+    pub depth: u8,
+    pub score: i32,
+    pub node_type: NodeType,
+    pub best_move: Option<Move>,
+}
+
 #[derive(Clone, Copy)]
 pub struct TTEntry {
     pub hash: ZobristHash,
@@ -102,6 +112,26 @@ impl TranspositionTable {
         }
 
         None
+    }
+
+    /// v1.1.0: полный probe без проверки границ — возвращает запись, если ключ совпал.
+    /// Границы узел проверяет сам (ему нужна ещё и глубина записи для singular).
+    pub fn probe_full(&mut self, hash: ZobristHash) -> Option<TTData> {
+        let idx = self.index(hash);
+        let entry = &self.entries[idx];
+
+        if entry.hash == hash {
+            self.hits += 1;
+            Some(TTData {
+                depth: entry.depth,
+                score: entry.score,
+                node_type: entry.node_type,
+                best_move: entry.best_move,
+            })
+        } else {
+            self.misses += 1;
+            None
+        }
     }
 
     pub fn store(&mut self, hash: ZobristHash, depth: u8, score: i32, node_type: NodeType, best_move: Option<Move>) {

@@ -459,6 +459,30 @@ mod tests {
         assert_eq!(perft(&b, gen, 3), 9_467);
     }
 
+    // v1.1.0: две дополнительные эталонные perft-позиции CPW —
+    // нагрузка на новые маски шаха/связок в легальной генерации.
+    #[test]
+    fn perft_position5() {
+        // превращения, шахи, рокировки (сложный узел)
+        let gen = MoveGenerator::get();
+        let b = Board::from_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R w KQ - 1 8");
+        assert_eq!(perft(&b, gen, 1), 44);
+        assert_eq!(perft(&b, gen, 2), 1_486);
+        assert_eq!(perft(&b, gen, 3), 62_379);
+    }
+
+    #[test]
+    fn perft_position6() {
+        // сбалансированная миттельшпильная позиция со взятиями и шахами
+        let gen = MoveGenerator::get();
+        let b = Board::from_fen(
+            "r4rk1/1pp1qppp/p1np1n2/2b1p1B1/2B1P1b1/P1NP1N2/1PP1QPPP/R4RK1 w - - 0 10",
+        );
+        assert_eq!(perft(&b, gen, 1), 46);
+        assert_eq!(perft(&b, gen, 2), 2_079);
+        assert_eq!(perft(&b, gen, 3), 89_890);
+    }
+
     #[test]
     fn incremental_hash_matches_recompute() {
         // Случайные партии из разных стартовых позиций: после КАЖДОГО хода

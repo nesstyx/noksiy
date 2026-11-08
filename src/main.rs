@@ -11,7 +11,7 @@ mod see;
 use uci::UciEngine;
 
 fn main() {
-    println!("Noksiy Chess Engine v1.0.0");
+    println!("Noksiy Chess Engine v1.1.0");
     println!("The world's strongest AI-written chess engine in Rust");
     println!("100% AI-generated code");
     println!("Type 'uci' to start UCI protocol");
